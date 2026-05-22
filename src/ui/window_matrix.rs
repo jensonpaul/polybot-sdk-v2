@@ -82,6 +82,8 @@ impl PolymarketDashboardApp {
                                     if order.side.to_lowercase() == "buy" && order.size_matched != "0" {
                                         ui.horizontal(|ui| {
                                             ui.small("⚡ Inline Position Mitigation Desk:");
+
+                                            // --- Limit Sell Section ---
                                             ui.small("Price:");
                                             ui.add(egui::TextEdit::singleline(&mut order.inline_sell_price).desired_width(50.0));
                                             ui.small("Size:");
@@ -92,6 +94,26 @@ impl PolymarketDashboardApp {
                                                     token: order.token.clone(),
                                                     price: order.inline_sell_price.clone(),
                                                     size: order.inline_sell_size.clone(),
+                                                    window_ts: window.timestamp_5m,
+                                                });
+                                            }
+
+                                            // --- Market Sell Section ---
+                                            ui.separator(); // visual separation
+                                            ui.small("Market Size:");
+                                            ui.add(egui::TextEdit::singleline(&mut order.inline_sell_size).desired_width(50.0));
+
+                                            // Order Type Selector
+                                            ui.radio_value(&mut order.inline_sell_market_type, "FAK".to_string(), "FAK");
+                                            ui.radio_value(&mut order.inline_sell_market_type, "FOK".to_string(), "FOK");
+
+                                            if ui.small_button("Instant Counter Market Sell").clicked() {
+                                                let _ = self.cmd_tx.try_send(UiCommand::PlaceMarket {
+                                                    side: "sell".into(),
+                                                    token: order.token.clone(),
+                                                    usdc: None,
+                                                    shares: Some(order.inline_sell_size.clone()),
+                                                    order_type: Some(order.inline_sell_market_type.clone()),
                                                     window_ts: window.timestamp_5m,
                                                 });
                                             }

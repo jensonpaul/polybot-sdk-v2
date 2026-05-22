@@ -20,6 +20,7 @@ pub struct TrackedOrder {
     pub size_matched: String,
     pub inline_sell_price: String,
     pub inline_sell_size: String,
+    pub inline_sell_market_type: String,
 }
 
 #[derive(Clone, Debug)]

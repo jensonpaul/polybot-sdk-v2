@@ -171,7 +171,7 @@ impl PolymarketWorker {
                                 window_ts,
                                 order_id: order_id.clone(),
                                 status: target_status,
-                                matched: matched_string,
+                                matched: order_info.size_matched.to_string(),
                             })
                             .await;
                     }
@@ -245,6 +245,7 @@ impl PolymarketWorker {
                                             size_matched: "0".to_string(),
                                             inline_sell_price: "0.50".to_string(),
                                             inline_sell_size: "0".to_string(),
+                                            inline_sell_market_type: "FAK".to_string(),
                                         };
 
                                         {
@@ -312,6 +313,7 @@ impl PolymarketWorker {
                                             size_matched: "Full".to_string(),
                                             inline_sell_price: "0.50".to_string(),
                                             inline_sell_size: "0".to_string(),
+                                            inline_sell_market_type: "FAK".to_string(),
                                         };
                                         let _ = update_tx.send(WorkerUpdate::OrderAdded { window_ts, order: new_order }).await;
                                         let _ = update_tx
@@ -394,7 +396,7 @@ impl PolymarketWorker {
                                     window_ts,
                                     order_id,
                                     status: target_status,
-                                    matched: matched_string,
+                                    matched: order_info.size_matched.to_string(),
                                 })
                                 .await;
                         }
