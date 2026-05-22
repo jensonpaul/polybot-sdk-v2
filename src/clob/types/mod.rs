@@ -296,36 +296,6 @@ pub enum OrderStatusType {
 #[derive(Clone, Debug, Display, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 #[strum(serialize_all = "UPPERCASE")]
-pub enum OpenOrderStatusType {
-    #[serde(rename = "LIVE", alias = "live")]
-    Live,
-    
-    #[serde(rename = "INVALID")]
-    Invalid,
-    
-    #[serde(rename = "CANCELED_MARKET_RESOLVED")]
-    CanceledMarketResolved,
-    
-    #[serde(rename = "CANCELED", alias = "canceled")]
-    Canceled,
-    
-    #[serde(rename = "MATCHED", alias = "matched")]
-    Matched,
-
-    #[serde(alias = "delayed")]
-    Delayed,
-
-    #[serde(alias = "unmatched")]
-    Unmatched,
-    
-    #[serde(untagged)]
-    Unknown(String),
-}
-
-#[non_exhaustive]
-#[derive(Clone, Debug, Display, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-#[strum(serialize_all = "UPPERCASE")]
 pub enum TradeStatusType {
     #[serde(alias = "matched")]
     Matched,

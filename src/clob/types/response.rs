@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::auth::ApiKey;
-use crate::clob::types::{OrderStatusType, OpenOrderStatusType, OrderType, Side, TickSize, TradeStatusType, TraderSide};
+use crate::clob::types::{OrderStatusType, OrderType, Side, TickSize, TradeStatusType, TraderSide};
 use crate::serde_helpers::StringFromAny;
 use crate::types::{Address, B256, Decimal, U256};
 
@@ -331,7 +331,7 @@ where
 #[builder(on(String, into))]
 pub struct OpenOrderResponse {
     pub id: String,
-    pub status: OpenOrderStatusType,
+    pub status: OrderStatusType,
     pub owner: ApiKey,
     pub maker_address: Address,
     

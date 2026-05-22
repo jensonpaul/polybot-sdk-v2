@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         .with(env_filter)
         .with(stdout_layer)
         .with(file_writer)
-        .with(gui_layer)
+        //.with(gui_layer)
         .init();
 
     tracing::info!("Polymarket Advanced Trading Node Client Bootstrap Base Running...");
@@ -64,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         cmd_rx,
         update_tx: worker_update_tx,
         ctx: egui::Context::default(), // Will be updated dynamically by the worker structure
+        clob_client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     // 3. Kick off native engine runtime loops
