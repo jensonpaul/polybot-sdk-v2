@@ -1,23 +1,29 @@
 pub mod auth_gateway;
 pub mod order_forms;
 pub mod window_matrix;
+pub mod check_interval;
 
 use crate::ui_types::{NotificationKind, ToastNotification, UiCommand, WindowGroup, WorkerUpdate};
 use crate::worker::{build_slug_for_timestamp, initiate_stamp_5m};
 use eframe::egui;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::FromStr;
+use rust_decimal::RoundingStrategy;
 
 pub struct PolymarketDashboardApp {
     pub bearer_token: String,
     pub is_authenticated: bool,
     pub auto_refresh_active: bool,
+    pub poll_interval_ms: String,
 
     // Limit Order State Variables
     pub limit_side_buy: bool,
     pub limit_token_up: bool,
     pub limit_price: String,
     pub limit_size: String,
+    pub limit_rapid_price: String,
 
     // Market Order State Variables
     pub market_side_buy: bool,
@@ -57,10 +63,12 @@ impl PolymarketDashboardApp {
             bearer_token: expected_token,
             is_authenticated: false,
             auto_refresh_active: true,
+            poll_interval_ms: "4000".to_string(),
             limit_side_buy: true,
             limit_token_up: true,
             limit_price: "0.50".to_string(),
             limit_size: "10".to_string(),
+            limit_rapid_price: "0.00".to_string(),
             market_side_buy: true,
             market_token_up: true,
             market_usdc: "5.00".to_string(),
@@ -109,7 +117,10 @@ impl eframe::App for PolymarketDashboardApp {
                         if let Some(o) = w.orders.iter_mut().find(|o| o.id == order_id) {
                             o.status = status;
                             o.size_matched = matched.clone();
-                            o.inline_sell_size = matched;
+                            //o.inline_sell_size = matched;
+                            // truncation to 2 decimals
+                            o.inline_sell_size = round_to_two_dp(&matched);
+                            o.rapid_sell_size  = round_to_two_dp(&matched);
                         }
                     }
                 }
@@ -174,6 +185,8 @@ impl eframe::App for PolymarketDashboardApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_order_consoles(ui, current_ts);
             ui.add_space(10.0);
+            self.render_polling_interval(ui);
+            ui.add_space(10.0);
             self.render_lifecycle_matrix(ui);
         });
 
@@ -181,4 +194,12 @@ impl eframe::App for PolymarketDashboardApp {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
+}
+
+/// Rounds a numeric string to 2 decimal places using "ToZero" strategy.
+/// If parsing fails, returns the original string.
+fn round_to_two_dp(value: &str) -> String {
+    Decimal::from_str(value)
+        .map(|d| d.round_dp_with_strategy(2, RoundingStrategy::ToZero).to_string())
+        .unwrap_or_else(|_| value.to_string())
 }

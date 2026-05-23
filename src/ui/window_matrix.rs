@@ -42,6 +42,7 @@ impl PolymarketDashboardApp {
                         ui.label("No structural logs found inside this localized window iteration frame container.");
                     } else {
                         for order in window.orders.iter_mut() {
+                            /*
                             let frame_color = match &order.status {
                                 LocalOrderStatus::FullyFilled => egui::Color32::from_rgba_unmultiplied(20, 120, 20, 30),
                                 LocalOrderStatus::PartiallyFilled { .. } => egui::Color32::from_rgba_unmultiplied(140, 130, 10, 30),
@@ -49,9 +50,30 @@ impl PolymarketDashboardApp {
                                 LocalOrderStatus::Failed(_) => egui::Color32::from_rgba_unmultiplied(120, 20, 20, 30),
                                 _ => egui::Color32::from_rgba_unmultiplied(30, 30, 30, 30),
                             };
+                            */
+
+                            let frame_color = match &order.status {
+                                LocalOrderStatus::Canceled => egui::Color32::from_rgba_unmultiplied(80, 80, 80, 40),
+                                LocalOrderStatus::Failed(_) => egui::Color32::from_rgba_unmultiplied(140, 40, 40, 50),
+                                _ => {
+                                    match order.side.to_lowercase().as_str() {
+                                        "sell" => egui::Color32::from_rgba_unmultiplied(70, 100, 140, 45), // muted blue
+                                        "buy" => match order.token.to_lowercase().as_str() {
+                                            "up" => egui::Color32::from_rgba_unmultiplied(60, 130, 60, 45),   // muted green
+                                            "down" => egui::Color32::from_rgba_unmultiplied(140, 50, 50, 45), // muted red
+                                            _ => egui::Color32::from_rgba_unmultiplied(60, 60, 60, 35),       // fallback
+                                        },
+                                        _ => egui::Color32::from_rgba_unmultiplied(40, 40, 40, 25),       // fallback
+                                    }
+                                }
+                            };
 
                             egui::Frame::none()
                                 .fill(frame_color)
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    egui::Color32::from_gray(90),
+                                ))
                                 .corner_radius(4.0)
                                 .inner_margin(6.0)
                                 .show(ui, |ui| {
@@ -94,6 +116,7 @@ impl PolymarketDashboardApp {
                                                     token: order.token.clone(),
                                                     price: order.inline_sell_price.clone(),
                                                     size: order.inline_sell_size.clone(),
+                                                    rapid_price: "0".to_string(),
                                                     window_ts: window.timestamp_5m,
                                                 });
                                             }

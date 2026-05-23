@@ -21,6 +21,8 @@ pub struct TrackedOrder {
     pub inline_sell_price: String,
     pub inline_sell_size: String,
     pub inline_sell_market_type: String,
+    pub rapid_sell_price: String,
+    pub rapid_sell_size: String,
 }
 
 #[derive(Clone, Debug)]
@@ -54,11 +56,15 @@ pub enum UiCommand {
     InitializeClient {
         token: String,
     },
+    UpdatePollInterval {
+        milliseconds: u64,
+    },
     PlaceLimit {
         side: String,
         token: String,
         price: String,
         size: String,
+        rapid_price: String,
         window_ts: u64,
     },
     PlaceMarket {

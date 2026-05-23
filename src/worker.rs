@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // START
 // SDK dependencies
@@ -94,7 +95,10 @@ impl PolymarketWorker {
     pub async fn run(mut self) -> anyhow::Result<()> {
         tracing::info!("PolymarketWorker: running execution loop");
 
+        let polling_interval_ms = Arc::new(AtomicU64::new(4000));
+
         let orders_to_poll = Arc::new(Mutex::new(Vec::<(u64, String)>::new()));
+        let tracked_orders = Arc::new(Mutex::new(HashMap::<String, TrackedOrder>::new()));
 
         // Initialize the client
         let client = self.init_clob_client().await?;
@@ -104,14 +108,59 @@ impl PolymarketWorker {
         // TASK 1: Isolated Heartbeat Polling Loop
         // -------------------------------------------------------------
         let poll_orders = Arc::clone(&orders_to_poll);
+        let tracked_orders_for_polling = tracked_orders.clone();
         let poll_tx = self.update_tx.clone();
         let poll_ctx = self.ctx.clone();
 
         let clob_client_for_tracking = clob_client.clone(); // clone the Arc for this task
 
+        // Clone for polling task
+        let polling_interval_for_polling =
+            polling_interval_ms.clone();
+
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(4));
+            let mut current_interval =
+                polling_interval_for_polling.load(Ordering::Relaxed);
+
+            let mut interval = tokio::time::interval(
+                Duration::from_millis(
+                    current_interval.max(1) // prevent panic
+                ),
+            );
+
             loop {
+                let latest_interval =
+                    polling_interval_for_polling.load(Ordering::Relaxed);
+
+                // Detect interval changes
+                if latest_interval != current_interval {
+                    current_interval = latest_interval;
+
+                    // Only rebuild timer if enabled
+                    if current_interval > 0 {
+                        interval = tokio::time::interval(
+                            Duration::from_millis(current_interval),
+                        );
+
+                        tracing::info!(
+                            "Polling interval updated to {} ms",
+                            current_interval
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Order polling disabled"
+                        );
+                    }
+                }
+
+                // ------------------------------------
+                // POLLING DISABLED
+                // ------------------------------------
+                if current_interval == 0 {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+
                 interval.tick().await;
 
                 let active_tracked_orders: Vec<(u64, String)> = {
@@ -124,6 +173,8 @@ impl PolymarketWorker {
                 }
 
                 let mut active_removals = Vec::new();
+
+                let rapid_orders_to_poll = Arc::clone(&poll_orders);
 
                 for (window_ts, order_id) in active_tracked_orders {
                     // Assuming get_order_status now returns anyhow::Result<OpenOrderResponse>
@@ -174,9 +225,130 @@ impl PolymarketWorker {
                                 matched: order_info.size_matched.to_string(),
                             })
                             .await;
+
+                        // -------------------------------
+                        // 4. RAPID SELL LOGIC (ONLY FOR BUY ORDERS, MIN SIZE 5)
+                        // -------------------------------
+                        if let Some(o) = tracked_orders_for_polling
+                            .lock()
+                            .await
+                            .get_mut(&order_id)
+                        {
+                            // Only consider buy orders for rapid sell
+                            if o.side.to_lowercase() == "buy" {
+                                if let (Ok(matched), Ok(sell_price), Ok(already_sold)) = (
+                                    Decimal::from_str(&o.size_matched),
+                                    Decimal::from_str(&o.rapid_sell_price),
+                                    Decimal::from_str(&o.rapid_sell_size),
+                                ) {
+                                    // Only auto-sell if price is set and matched >= 5
+                                    let min_sell_size = Decimal::from(5);
+                                    if sell_price > Decimal::ZERO && matched >= min_sell_size {
+                                        let sell_amount = (matched - already_sold).max(Decimal::ZERO);
+
+                                        if sell_amount >= min_sell_size {
+                                            let sell_req = OrderLimitRequest {
+                                                side: "sell".into(),
+                                                token: o.token.clone(),
+                                                price: o.rapid_sell_price.clone(),
+                                                size: sell_amount.to_string(),
+                                            };
+
+                                            let clob_client_clone = clob_client_for_tracking.clone();
+                                            let update_tx_clone = poll_tx.clone();
+                                            let window_ts_clone = window_ts;
+                                            let token_clone = o.token.clone();
+                                            let rapid_sell_price_clone = o.rapid_sell_price.clone();
+                                            //let rapid_sell_market_type_clone = o.rapid_sell_market_type.clone();
+                                            let rapid_orders_to_poll_clone = Arc::clone(&rapid_orders_to_poll); // <-- for tracking
+                                            let tracked_orders_clone = tracked_orders_for_polling.clone();
+
+                                            tokio::spawn(async move {
+                                                match place_order_limit(
+                                                    clob_client_clone,
+                                                    &sell_req,
+                                                    &build_slug_for_timestamp(window_ts_clone),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(resp) => {
+                                                        if let Ok(new_order_id) = parse_order_api_response(resp) {
+                                                            // 1️⃣ Notify UI
+                                                            let _ = update_tx_clone
+                                                                .send(WorkerUpdate::Notify {
+                                                                    message: format!(
+                                                                        "Inline Rapid Sell Placed: {} {} @ {}",
+                                                                        sell_amount, token_clone, sell_price
+                                                                    ),
+                                                                    kind: NotificationKind::Success,
+                                                                })
+                                                                .await;
+
+                                                            // 2️⃣ Track the new order
+                                                            {
+                                                                let mut lock = rapid_orders_to_poll_clone.lock().await;
+                                                                lock.push((window_ts_clone, new_order_id.clone()));
+                                                            }
+
+                                                            // 3️⃣ Create a new TrackedOrder for UI
+                                                            let new_tracked_order = TrackedOrder {
+                                                                id: new_order_id.clone(),
+                                                                side: "sell".into(),
+                                                                token: token_clone,
+                                                                price: rapid_sell_price_clone,
+                                                                size: sell_amount.to_string(),
+                                                                status: LocalOrderStatus::Open,
+                                                                size_matched: "0".into(),
+                                                                inline_sell_price: "0".into(),
+                                                                inline_sell_size: "0".into(),
+                                                                inline_sell_market_type: "FAK".to_string(),
+                                                                rapid_sell_price: "0".to_string(),
+                                                                rapid_sell_size: "0".into(),
+                                                            };
+
+                                                            // Store in worker registry
+                                                            {
+                                                                let mut tracked =
+                                                                    tracked_orders_clone
+                                                                        .lock()
+                                                                        .await;
+
+                                                                tracked.insert(
+                                                                    new_order_id.clone(),
+                                                                    new_tracked_order.clone(),
+                                                                );
+                                                            }
+
+                                                            let _ = update_tx_clone
+                                                                .send(WorkerUpdate::OrderAdded {
+                                                                    window_ts: window_ts_clone,
+                                                                    order: new_tracked_order,
+                                                                })
+                                                                .await;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = update_tx_clone
+                                                            .send(WorkerUpdate::Notify {
+                                                                message: format!("Inline Rapid Sell Failed: {}", e),
+                                                                kind: NotificationKind::Error,
+                                                            })
+                                                            .await;
+                                                    }
+                                                }
+                                            });
+
+                                            // Update rapid_sell_size to prevent double-selling
+                                            o.rapid_sell_size = matched.to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
+                // Remove fully filled/canceled orders from polling
                 if !active_removals.is_empty() {
                     let mut lock = poll_orders.lock().await;
                     lock.retain(|(_, id)| !active_removals.contains(id));
@@ -193,9 +365,12 @@ impl PolymarketWorker {
 
         while let Some(cmd) = self.cmd_rx.recv().await {
             tracing::info!("WORKER: Received command from UI channel: {:?}", cmd);
+            let polling_interval_ms_for_commands =
+                polling_interval_ms.clone();
             let update_tx = self.update_tx.clone();
             let ctx = self.ctx.clone();
             let cmd_orders_list = Arc::clone(&orders_to_poll);
+            let cmd_tracked_orders = Arc::clone(&tracked_orders);
 
             let clob_client_for_ui_command = clob_client.clone(); // clone the Arc for this task
 
@@ -207,7 +382,18 @@ impl PolymarketWorker {
                     // you would pass the token to it here. 
                     // e.g., *self.client.lock().unwrap() = Some(PolymarketClient::new(token));
                 }
-                UiCommand::PlaceLimit { side, token, price, size, window_ts } => {
+                UiCommand::UpdatePollInterval { milliseconds } => {
+                    polling_interval_ms_for_commands.store(
+                        milliseconds,
+                        Ordering::Relaxed,
+                    );
+
+                    tracing::info!(
+                        "Updated polling interval to {} ms",
+                        milliseconds
+                    );
+                }
+                UiCommand::PlaceLimit { side, token, price, size, rapid_price, window_ts } => {
                     tracing::info!("Worker caught PlaceLimit command!");
                     tokio::spawn(async move {
                         /*
@@ -243,15 +429,36 @@ impl PolymarketWorker {
                                             size,
                                             status: LocalOrderStatus::Open,
                                             size_matched: "0".to_string(),
-                                            inline_sell_price: "0.50".to_string(),
+                                            inline_sell_price: "0.10".to_string(),
                                             inline_sell_size: "0".to_string(),
                                             inline_sell_market_type: "FAK".to_string(),
+                                            rapid_sell_price: rapid_price.to_string(),
+                                            rapid_sell_size: "0".into(),
                                         };
 
                                         {
                                             let mut lock = cmd_orders_list.lock().await;
                                             lock.push((window_ts, order_id.clone()));
                                         }
+
+                                        {
+                                            let mut tracked =
+                                                cmd_tracked_orders
+                                                    .lock()
+                                                    .await;
+
+                                            tracked.insert(
+                                                order_id.clone(),
+                                                new_order.clone(),
+                                            );
+                                        }
+
+                                        /*
+                                        tracked_orders
+                                            .lock()
+                                            .await
+                                            .insert(order_id.clone(), new_order.clone());
+                                            */
 
                                         let _ = update_tx.send(WorkerUpdate::OrderAdded { window_ts, order: new_order }).await;
                                         let _ = update_tx
@@ -314,7 +521,27 @@ impl PolymarketWorker {
                                             inline_sell_price: "0.50".to_string(),
                                             inline_sell_size: "0".to_string(),
                                             inline_sell_market_type: "FAK".to_string(),
+                                            rapid_sell_price: "0.00".to_string(),
+                                            rapid_sell_size: "0".into(),
                                         };
+
+                                        {
+                                            let mut lock = cmd_orders_list.lock().await;
+                                            lock.push((window_ts, order_id.clone()));
+                                        }
+
+                                        {
+                                            let mut tracked =
+                                                cmd_tracked_orders
+                                                    .lock()
+                                                    .await;
+
+                                            tracked.insert(
+                                                order_id.clone(),
+                                                new_order.clone(),
+                                            );
+                                        }
+
                                         let _ = update_tx.send(WorkerUpdate::OrderAdded { window_ts, order: new_order }).await;
                                         let _ = update_tx
                                             .send(WorkerUpdate::Notify {
@@ -394,11 +621,131 @@ impl PolymarketWorker {
                             let _ = update_tx
                                 .send(WorkerUpdate::OrderUpdated {
                                     window_ts,
-                                    order_id,
+                                    order_id: order_id.clone(),
                                     status: target_status,
                                     matched: order_info.size_matched.to_string(),
                                 })
                                 .await;
+
+                            // -------------------------------
+                            // 4. RAPID SELL LOGIC (ONLY FOR BUY ORDERS, MIN SIZE 5)
+                            // -------------------------------
+                            if let Some(o) = cmd_tracked_orders
+                                .lock()
+                                .await
+                                .get_mut(&order_id)
+                            {
+                                // Only consider buy orders for rapid sell
+                                if o.side.to_lowercase() == "buy" {
+                                    if let (Ok(matched), Ok(sell_price), Ok(already_sold)) = (
+                                        Decimal::from_str(&o.size_matched),
+                                        Decimal::from_str(&o.rapid_sell_price),
+                                        Decimal::from_str(&o.rapid_sell_size),
+                                    ) {
+                                        // Only auto-sell if price is set and matched >= 5
+                                        let min_sell_size = Decimal::from(5);
+                                        if sell_price > Decimal::ZERO && matched >= min_sell_size {
+                                            let sell_amount = (matched - already_sold).max(Decimal::ZERO);
+
+                                            if sell_amount >= min_sell_size {
+                                                let sell_req = OrderLimitRequest {
+                                                    side: "sell".into(),
+                                                    token: o.token.clone(),
+                                                    price: o.rapid_sell_price.clone(),
+                                                    size: sell_amount.to_string(),
+                                                };
+
+                                                let clob_client_clone = clob_client_for_ui_command.clone();
+                                                let update_tx_clone = update_tx.clone();
+                                                let window_ts_clone = window_ts;
+                                                let token_clone = o.token.clone();
+                                                let rapid_sell_price_clone = o.rapid_sell_price.clone();
+                                                //let rapid_sell_market_type_clone = o.rapid_sell_market_type.clone();
+                                                let cmd_orders_list_clone = Arc::clone(&cmd_orders_list); // <-- for tracking
+                                                let cmd_tracked_orders_clone = Arc::clone(&cmd_tracked_orders);
+
+                                                tokio::spawn(async move {
+                                                    match place_order_limit(
+                                                        clob_client_clone,
+                                                        &sell_req,
+                                                        &build_slug_for_timestamp(window_ts_clone),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(resp) => {
+                                                            if let Ok(new_order_id) = parse_order_api_response(resp) {
+                                                                // 1️⃣ Notify UI
+                                                                let _ = update_tx_clone
+                                                                    .send(WorkerUpdate::Notify {
+                                                                        message: format!(
+                                                                            "Inline Rapid Sell Placed: {} {} @ {}",
+                                                                            sell_amount, token_clone, sell_price
+                                                                        ),
+                                                                        kind: NotificationKind::Success,
+                                                                    })
+                                                                    .await;
+
+                                                                // 2️⃣ Track the new order
+                                                                {
+                                                                    let mut lock = cmd_orders_list_clone.lock().await;
+                                                                    lock.push((window_ts_clone, new_order_id.clone()));
+                                                                }
+
+                                                                // 3️⃣ Create a new TrackedOrder for UI
+                                                                let new_tracked_order = TrackedOrder {
+                                                                    id: new_order_id.clone(),
+                                                                    side: "sell".into(),
+                                                                    token: token_clone,
+                                                                    price: rapid_sell_price_clone,
+                                                                    size: sell_amount.to_string(),
+                                                                    status: LocalOrderStatus::Open,
+                                                                    size_matched: "0".into(),
+                                                                    inline_sell_price: "0".into(),
+                                                                    inline_sell_size: "0".into(),
+                                                                    inline_sell_market_type: "FAK".to_string(),
+                                                                    rapid_sell_price: "0.00".to_string(),
+                                                                    rapid_sell_size: "0".into(),
+                                                                };
+
+                                                                // Store in worker registry
+                                                                {
+                                                                    let mut tracked =
+                                                                        cmd_tracked_orders_clone
+                                                                            .lock()
+                                                                            .await;
+
+                                                                    tracked.insert(
+                                                                        new_order_id.clone(),
+                                                                        new_tracked_order.clone(),
+                                                                    );
+                                                                }
+
+                                                                let _ = update_tx_clone
+                                                                    .send(WorkerUpdate::OrderAdded {
+                                                                        window_ts: window_ts_clone,
+                                                                        order: new_tracked_order,
+                                                                    })
+                                                                    .await;
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = update_tx_clone
+                                                                .send(WorkerUpdate::Notify {
+                                                                    message: format!("Inline Rapid Sell Failed: {}", e),
+                                                                    kind: NotificationKind::Error,
+                                                                })
+                                                                .await;
+                                                        }
+                                                    }
+                                                });
+
+                                                // Update rapid_sell_size to prevent double-selling
+                                                o.rapid_sell_size = matched.to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         ctx.request_repaint();
                     });

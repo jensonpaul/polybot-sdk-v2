@@ -24,12 +24,17 @@ impl PolymarketDashboardApp {
                     ui.label("Contract Size:   ");
                     ui.text_edit_singleline(&mut self.limit_size);
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Rapid Sell (Auto) Price Target ($):");
+                    ui.text_edit_singleline(&mut self.limit_rapid_price);
+                });
                 if ui.button("Execute Limit Placement").clicked() {
                     let cmd = UiCommand::PlaceLimit {
                         side: if self.limit_side_buy { "buy".into() } else { "sell".into() },
                         token: if self.limit_token_up { "up".into() } else { "down".into() },
                         price: self.limit_price.clone(),
                         size: self.limit_size.clone(),
+                        rapid_price: self.limit_rapid_price.clone(),
                         window_ts: current_ts,
                     };
 
