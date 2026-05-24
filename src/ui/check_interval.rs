@@ -1,34 +1,56 @@
 use crate::ui::PolymarketDashboardApp;
 use crate::ui_types::{NotificationKind, UiCommand};
+use crate::worker_config::Queue;
 use eframe::egui;
 
 impl PolymarketDashboardApp {
-    pub fn render_polling_interval(&mut self, ui: &mut egui::Ui) {
+    pub fn render_poll_interval_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        queue: Queue,
+    ) {
         ui.horizontal(|ui| {
-            ui.label("Order Check Interval (ms):");
+            ui.label(label);
 
-            let response = ui.text_edit_singleline(&mut self.poll_interval_ms);
+            let response = ui.text_edit_singleline(
+                self.interval_inputs.get_mut(queue)
+            );
 
-            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let Ok(ms) = self.poll_interval_ms.parse::<u64>() {
-                    let tx = self.cmd_tx.clone();
+            if response.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            {
+                let value = self.interval_inputs.get(queue);
 
-                    tokio::spawn(async move {
-                        let _ = tx
-                            .try_send(UiCommand::UpdatePollInterval {
-                                milliseconds: ms,
-                            });
-                    });
+                match value.parse::<u64>() {
+                    Ok(ms) => {
+                        let tx = self.cmd_tx.clone();
 
-                    self.push_toast(
-                        format!("Polling interval updated to {} ms", ms),
-                        NotificationKind::Success,
-                    );
-                } else {
-                    self.push_toast(
-                        "Invalid interval value".to_string(),
-                        NotificationKind::Error,
-                    );
+                        tokio::spawn(async move {
+                            let _ = tx.try_send(
+                                UiCommand::UpdatePollInterval {
+                                    milliseconds: ms,
+                                    queue,
+                                },
+                            );
+                        });
+
+                        self.push_toast(
+                            format!(
+                                "{} interval updated to {} ms",
+                                label,
+                                ms
+                            ),
+                            NotificationKind::Success,
+                        );
+                    }
+
+                    Err(_) => {
+                        self.push_toast(
+                            "Invalid interval value".to_string(),
+                            NotificationKind::Error,
+                        );
+                    }
                 }
             }
         });

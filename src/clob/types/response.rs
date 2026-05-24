@@ -14,6 +14,8 @@ use serde_with::{
 };
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
+use serde::de::Deserializer as DeDeserializer;
+use std::str::FromStr;
 
 use crate::Result;
 use crate::auth::ApiKey;
@@ -510,10 +512,28 @@ pub struct MakerOrder {
     pub maker_address: Address,
     pub matched_amount: Decimal,
     pub price: Decimal,
-    pub fee_rate_bps: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_or_empty")]
+    pub fee_rate_bps: Option<Decimal>,
     pub asset_id: U256,
     pub outcome: String,
     pub side: Side,
+}
+
+pub fn deserialize_decimal_or_empty<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Decimal>, D::Error>
+where
+    D: DeDeserializer<'de>,
+{
+    let v = String::deserialize(deserializer)?;
+
+    if v.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Decimal::from_str(&v)
+        .map(Some)
+        .map_err(|e| serde::de::Error::custom(e.to_string()))
 }
 
 #[non_exhaustive]

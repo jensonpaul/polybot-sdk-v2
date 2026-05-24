@@ -1,11 +1,13 @@
 mod ui_types;
 mod logger;
 mod worker;
+mod worker_config;
 mod ui;
 
 use std::fs::OpenOptions;
 use tracing_subscriber::{fmt::writer::MakeWriterExt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use ui_types::{UiCommand, WorkerUpdate};
+use worker_config::{PollConfig, SharedPollConfig, Queue};
 use logger::GuiLogger;
 use worker::PolymarketWorker;
 use ui::PolymarketDashboardApp;
@@ -14,6 +16,9 @@ use ui::PolymarketDashboardApp;
 async fn main() -> anyhow::Result<()> {
     // Gracefully handle missing .env files
     let _ = dotenv::dotenv();
+
+    let poll_config: SharedPollConfig =
+        std::sync::Arc::new(PollConfig::new());
 
     // 1. Initialize bounded communication channels
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<UiCommand>(100);
@@ -65,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
         update_tx: worker_update_tx,
         ctx: egui::Context::default(), // Will be updated dynamically by the worker structure
         clob_client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        poll_config: poll_config.clone(),
     };
 
     // 3. Kick off native engine runtime loops
@@ -80,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
                 worker.run().await;
             });
 
-            Ok(Box::new(PolymarketDashboardApp::new(cc, cmd_tx, update_rx)))
+            Ok(Box::new(PolymarketDashboardApp::new(cc, cmd_tx, update_rx, poll_config)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("Eframe running failure: {:?}", e))?;

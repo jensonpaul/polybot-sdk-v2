@@ -39,12 +39,6 @@ use tracing::{info, instrument};
 
 pub use polybot_sdk_v2::error::Error;
 
-const MAX_RAPID_RETRIES: u32 = 5;
-
-const BASE_RETRY_DELAY_SECS: u64 = 2;
-
-const MAX_RETRY_DELAY_SECS: u64 = 60;
-
 lazy_static! {
     static ref MARKET_BY_SLUG_CACHE:
         std::sync::Mutex<HashMap<String, Market>>
@@ -55,32 +49,6 @@ lazy_static! {
         = std::sync::Mutex::new(HashMap::new());
 }
 // END
-
-pub fn is_permanent_rapid_sell_error(
-    err: &str,
-) -> bool {
-
-    let err_lower = err.to_lowercase();
-
-    err_lower.contains("not enough balance")
-        || err_lower.contains("allowance")
-        || err_lower.contains("invalid order")
-        || err_lower.contains("no market price")
-        || err_lower.contains("order amount")
-}
-
-pub fn compute_retry_delay_secs(
-    retry_count: u32,
-) -> u64 {
-
-    let exponential =
-        BASE_RETRY_DELAY_SECS
-            .saturating_mul(
-                2u64.saturating_pow(retry_count)
-            );
-
-    exponential.min(MAX_RETRY_DELAY_SECS)
-}
 
 pub struct PolymarketWorker {
     pub cmd_rx: Receiver<UiCommand>,
@@ -636,16 +604,17 @@ impl PolymarketWorker {
                 // -------------------------------------------------
                 // SNAPSHOT TRACKED ORDERS
                 // -------------------------------------------------
-                let mut snapshot = {
+                let snapshot = {
                     tracked_orders_for_rapid
                         .lock()
                         .await
+                        .clone()
                 };
 
                 // -------------------------------------------------
                 // PROCESS RAPID SELLS
                 // -------------------------------------------------
-                for snapshot_order in snapshot.values()  {
+                for (_, snapshot_order) in snapshot {
 
                     // ---------------------------------------------
                     // BUY ORDERS ONLY
@@ -675,36 +644,12 @@ impl PolymarketWorker {
                     // ---------------------------------------------
                     // PREVENT DUPLICATE ATTEMPTS
                     // ---------------------------------------------
-                    match &snapshot_order.rapid_sell_state {
-
-                        RapidSellState::Idle => {}
-
-                        RapidSellState::Failed {
-                            retry_count,
-                            next_retry_at,
-                            ..
-                        } => {
-
-                            // max retries exceeded
-                            if *retry_count >= MAX_RAPID_RETRIES {
-                                tracing::warn!(
-                                    "Rapid sell permanently stopped after {} retries for {}",
-                                    retry_count,
-                                    snapshot_order.id
-                                );
-                                continue;
-                            }
-
-                            // cooldown not elapsed
-                            if std::time::Instant::now()
-                                < *next_retry_at
-                            {
-                                continue;
-                            }
-                        }
-
-                        // ALL OTHER STATES BLOCK
-                        _ => continue,
+                    if !matches!(
+                        snapshot_order.rapid_sell_state,
+                        RapidSellState::Idle
+                            | RapidSellState::Failed(_)
+                    ) {
+                        continue;
                     }
 
                     // ---------------------------------------------
@@ -749,7 +694,6 @@ impl PolymarketWorker {
                     // ---------------------------------------------
                     // MARK PENDING IMMEDIATELY
                     // ---------------------------------------------
-                    /*
                     {
                         let mut tracked =
                             tracked_orders_for_rapid
@@ -765,40 +709,6 @@ impl PolymarketWorker {
                                 RapidSellState::Pending;
                         }
                     }
-                    */
-                    let should_spawn = {
-                    let mut tracked =
-                        tracked_orders_for_rapid
-                            .lock()
-                            .await;
-
-                    if let Some(order) =
-                        tracked.get_mut(
-                            &snapshot_order.id
-                        )
-                    {
-                        match order.rapid_sell_state {
-
-                            RapidSellState::Idle
-                            | RapidSellState::Failed { .. } => {
-
-                                order.rapid_sell_state =
-                                    RapidSellState::Pending;
-
-                                true
-                            }
-
-                            _ => false,
-                        }
-                    }
-                    else {
-                        false
-                    }
-                };
-
-                if !should_spawn {
-                    continue;
-                }
 
                     tracing::info!(
                         "Attempting Rapid Sell: {:?}",
@@ -949,8 +859,6 @@ impl PolymarketWorker {
 
                                                 window_ts:
                                                     window_ts_clone,
-
-                                                rapid_sell_attempts: 0,
                                             };
 
                                         // -------------------------
@@ -1024,94 +932,15 @@ impl PolymarketWorker {
                                                 .lock()
                                                 .await;
 
-                                        let err_string = err.to_string();
-
                                         if let Some(parent) =
                                             tracked.get_mut(
                                                 &parent_order_id
                                             )
                                         {
-                                            // ---------------------------------
-                                            // PERMANENT FAILURE
-                                            // ---------------------------------
-                                            if is_permanent_rapid_sell_error(
-                                                &err_string
-                                            ) {
-
-                                                parent.rapid_sell_state =
-                                                    RapidSellState::Disabled {
-                                                        reason: err_string.clone(),
-                                                    };
-
-                                                tracing::warn!(
-                                                    "Rapid sell permanently disabled for {}: {}",
-                                                    parent_order_id,
-                                                    err_string
+                                            parent.rapid_sell_state =
+                                                RapidSellState::Failed(
+                                                    err.to_string()
                                                 );
-                                            }
-
-                                            // ---------------------------------
-                                            // RETRYABLE FAILURE
-                                            // ---------------------------------
-                                            else {
-
-                                                let retry_count: u32 =
-                                                    match &parent.rapid_sell_state {
-
-                                                        RapidSellState::Failed {
-                                                            retry_count,
-                                                            ..
-                                                        } => *retry_count + 1,
-
-                                                        _ => 1u32,
-                                                    };
-
-                                                if retry_count >= MAX_RAPID_RETRIES {
-
-                                                    parent.rapid_sell_state =
-                                                        RapidSellState::Disabled {
-
-                                                            reason: format!(
-                                                                "Exceeded max retries: {}",
-                                                                err_string
-                                                            ),
-                                                        };
-
-                                                    tracing::error!(
-                                                        "Rapid sell disabled after max retries for {}",
-                                                        parent_order_id
-                                                    );
-                                                }
-                                                else {
-
-                                                    let delay_secs =
-                                                        compute_retry_delay_secs(
-                                                            retry_count
-                                                        );
-
-                                                    parent.rapid_sell_state =
-                                                        RapidSellState::Failed {
-
-                                                            reason:
-                                                                err_string.clone(),
-
-                                                            retry_count,
-
-                                                            next_retry_at:
-                                                                std::time::Instant::now()
-                                                                    + Duration::from_secs(
-                                                                        delay_secs
-                                                                    ),
-                                                        };
-
-                                                    tracing::warn!(
-                                                        "Rapid sell retry {} scheduled in {}s for {}",
-                                                        retry_count,
-                                                        delay_secs,
-                                                        parent_order_id
-                                                    );
-                                                }
-                                            }
                                         }
 
                                         let _ =
@@ -1147,27 +976,10 @@ impl PolymarketWorker {
                                         &parent_order_id
                                     )
                                 {
-                                    let retry_count: u32 =
-                                        parent.rapid_sell_attempts as u32 + 1;
-
-                                    parent.rapid_sell_attempts =
-                                        retry_count as u8;
-
                                     parent.rapid_sell_state =
-                                        RapidSellState::Failed {
-
-                                            reason: err.to_string(),
-
-                                            retry_count,
-
-                                            next_retry_at:
-                                                std::time::Instant::now()
-                                                    + Duration::from_secs(
-                                                        compute_retry_delay_secs(
-                                                            retry_count
-                                                        )
-                                                    ),
-                                        };
+                                        RapidSellState::Failed(
+                                            err.to_string()
+                                        );
                                 }
 
                                 let _ =
@@ -1271,7 +1083,6 @@ impl PolymarketWorker {
                                             associate_trades: vec![],
                                             open_order_response: None,
                                             window_ts,
-                                            rapid_sell_attempts: 0,
                                         };
 
                                         {
@@ -1366,7 +1177,6 @@ impl PolymarketWorker {
                                             associate_trades: vec![],
                                             open_order_response: None,
                                             window_ts,
-                                            rapid_sell_attempts: 0,
                                         };
 
                                         {

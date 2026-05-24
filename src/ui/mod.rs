@@ -3,6 +3,7 @@ pub mod order_forms;
 pub mod window_matrix;
 pub mod check_interval;
 
+use crate::worker_config::{SharedPollConfig, Queue};
 use crate::ui_types::{NotificationKind, ToastNotification, UiCommand, WindowGroup, WorkerUpdate};
 use crate::worker::{build_slug_for_timestamp, initiate_stamp_5m};
 use eframe::egui;
@@ -11,12 +12,41 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromStr;
 use rust_decimal::RoundingStrategy;
+use std::collections::HashMap;
+use std::sync::{Arc};
+use std::sync::atomic::AtomicU64;
+
+pub struct IntervalInputs {
+    pub orders: String,
+    pub trades: String,
+    pub rapid_sell: String,
+}
+
+impl IntervalInputs {
+    fn get_mut(&mut self, queue: Queue) -> &mut String {
+        match queue {
+            Queue::Orders => &mut self.orders,
+            Queue::Trades => &mut self.trades,
+            Queue::RapidSell => &mut self.rapid_sell,
+        }
+    }
+
+    fn get(&self, queue: Queue) -> &str {
+        match queue {
+            Queue::Orders => &self.orders,
+            Queue::Trades => &self.trades,
+            Queue::RapidSell => &self.rapid_sell,
+        }
+    }
+}
 
 pub struct PolymarketDashboardApp {
     pub bearer_token: String,
     pub is_authenticated: bool,
     pub auto_refresh_active: bool,
-    pub poll_interval_ms: String,
+    
+    pub interval_inputs: IntervalInputs,
+    pub poll_config: SharedPollConfig,
 
     // Limit Order State Variables
     pub limit_side_buy: bool,
@@ -46,6 +76,7 @@ impl PolymarketDashboardApp {
         _cc: &eframe::CreationContext<'_>,
         cmd_tx: Sender<UiCommand>,
         update_rx: Receiver<WorkerUpdate>,
+        poll_config: SharedPollConfig,
     ) -> Self {
         let test_tx = cmd_tx.clone();
         tokio::spawn(async move {
@@ -63,7 +94,12 @@ impl PolymarketDashboardApp {
             bearer_token: expected_token,
             is_authenticated: false,
             auto_refresh_active: true,
-            poll_interval_ms: "4000".to_string(),
+            interval_inputs: IntervalInputs {
+                orders: poll_config.get(Queue::Orders).to_string(),
+                trades: poll_config.get(Queue::Trades).to_string(),
+                rapid_sell: poll_config.get(Queue::RapidSell).to_string(),
+            },
+            poll_config,
             limit_side_buy: true,
             limit_token_up: true,
             limit_price: "0.50".to_string(),
@@ -120,7 +156,7 @@ impl eframe::App for PolymarketDashboardApp {
                             //o.inline_sell_size = matched;
                             // truncation to 2 decimals
                             o.inline_sell_size = round_to_two_dp(&matched);
-                            o.rapid_sell_size  = round_to_two_dp(&matched);
+                            //o.rapid_sell_size  = round_to_two_dp(&matched);
                         }
                     }
                 }
@@ -185,7 +221,23 @@ impl eframe::App for PolymarketDashboardApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_order_consoles(ui, current_ts);
             ui.add_space(10.0);
-            self.render_polling_interval(ui);
+            self.render_poll_interval_input(
+                ui,
+                "Orders Interval (ms):",
+                Queue::Orders,
+            );
+
+            self.render_poll_interval_input(
+                ui,
+                "Trades Interval (ms):",
+                Queue::Trades,
+            );
+
+            self.render_poll_interval_input(
+                ui,
+                "Rapid Sell Interval (ms):",
+                Queue::RapidSell,
+            );
             ui.add_space(10.0);
             self.render_lifecycle_matrix(ui);
         });
