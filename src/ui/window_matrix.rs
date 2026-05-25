@@ -75,7 +75,8 @@ impl PolymarketDashboardApp {
                                     )
                                 )
                                 .strong()
-                                .color(Theme::BUY_GREEN)
+                                .color(Theme::TEXT_PRIMARY)
+                                .monospace()
                             );
                         });
 
@@ -99,7 +100,8 @@ impl PolymarketDashboardApp {
                                     )
                                 )
                                 .strong()
-                                .color(Theme::SELL_RED)
+                                .color(Theme::TEXT_PRIMARY)
+                                .monospace()
                             );
                         });
 

@@ -255,6 +255,7 @@ impl eframe::App for PolymarketDashboardApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_order_consoles(ui, current_ts);
             ui.add_space(10.0);
+            /*
             self.render_poll_interval_input(
                 ui,
                 "Orders Interval (ms):",
@@ -273,6 +274,7 @@ impl eframe::App for PolymarketDashboardApp {
                 Queue::RapidSell,
             );
             ui.add_space(10.0);
+            */
             self.render_lifecycle_matrix(ui);
         });
 

@@ -1,5 +1,6 @@
 use crate::ui::PolymarketDashboardApp;
 use crate::ui_types::UiCommand;
+use crate::worker_config::Queue;
 use eframe::egui;
 use crate::ui::theme::Theme;
 
@@ -11,7 +12,7 @@ impl PolymarketDashboardApp {
         current_ts: u64,
     ) {
 
-        ui.columns(2, |cols| {
+        ui.columns(3, |cols| {
 
             // =====================================================
             // LIMIT ORDER PANEL
@@ -356,6 +357,56 @@ impl PolymarketDashboardApp {
                             }
                         }
                     });
+                });
+
+            // =====================================================
+            // POLL INTERVAL PANEL
+            // =====================================================
+
+            egui::Frame::none()
+                .fill(Theme::BG_ELEVATED)
+                .stroke(
+                    egui::Stroke::new(
+                        1.0,
+                        Theme::BORDER
+                    )
+                )
+                .corner_radius(8.0)
+                .inner_margin(12.0)
+                .show(&mut cols[2], |ui| {
+
+                    ui.colored_label(
+                        Theme::TEXT_PRIMARY,
+                        egui::RichText::new(
+                            "⏱ INTERVAL CONFIG"
+                        )
+                        .strong()
+                        .size(16.0)
+                    );
+
+                    ui.separator();
+
+                    self.render_poll_interval_input(
+                        ui,
+                        "Orders",
+                        Queue::Orders,
+                    );
+
+                    ui.add_space(8.0);
+
+                    self.render_poll_interval_input(
+                        ui,
+                        "Trades",
+                        Queue::Trades,
+                    );
+
+                    ui.add_space(8.0);
+
+                    self.render_poll_interval_input(
+                        ui,
+                        "Rapid Sell",
+                        Queue::RapidSell,
+                    );
                 });
         });
     }
