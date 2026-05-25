@@ -2,6 +2,7 @@ mod ui_types;
 mod logger;
 mod worker;
 mod worker_config;
+mod market_data;
 mod ui;
 
 use std::fs::OpenOptions;
@@ -54,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 2. Window presentation configuration parameters
     let native_options = eframe::NativeOptions {
+        //renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 750.0])
             .with_min_inner_size([800.0, 500.0]),
@@ -71,6 +73,12 @@ async fn main() -> anyhow::Result<()> {
         ctx: egui::Context::default(), // Will be updated dynamically by the worker structure
         clob_client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         poll_config: poll_config.clone(),
+        market_tasks:
+            std::sync::Arc::new(
+                tokio::sync::Mutex::new(
+                    std::collections::HashMap::new()
+                )
+            ),
     };
 
     // 3. Kick off native engine runtime loops
@@ -78,6 +86,22 @@ async fn main() -> anyhow::Result<()> {
         "Polymarket SDK Controller App Console",
         native_options,
         Box::new(move |cc| {
+            
+            cc.egui_ctx.set_visuals(
+                egui::Visuals::dark()
+            );
+
+            let mut style =
+                (*cc.egui_ctx.style()).clone();
+
+            style.spacing.item_spacing =
+                egui::vec2(8.0, 8.0);
+
+            style.visuals.window_corner_radius =
+                8.0.into();
+
+            cc.egui_ctx.set_style(style);
+
             // Update the worker with the valid runtime UI context instance
             worker.ctx = cc.egui_ctx.clone();
 
@@ -86,7 +110,14 @@ async fn main() -> anyhow::Result<()> {
                 worker.run().await;
             });
 
-            Ok(Box::new(PolymarketDashboardApp::new(cc, cmd_tx, update_rx, poll_config)))
+            Ok(Box::new(
+                PolymarketDashboardApp::new(
+                    cc,
+                    cmd_tx,
+                    update_rx,
+                    poll_config,
+                )
+            ))
         }),
     )
     .map_err(|e| anyhow::anyhow!("Eframe running failure: {:?}", e))?;

@@ -39,6 +39,9 @@ use tracing::{info, instrument};
 
 pub use polybot_sdk_v2::error::Error;
 
+use arc_swap::ArcSwap;
+use crate::market_data::{MarketFeedHandle, MarketPrices, SharedMarketPrices, spawn_market_feed};
+
 lazy_static! {
     static ref MARKET_BY_SLUG_CACHE:
         std::sync::Mutex<HashMap<String, Market>>
@@ -56,6 +59,12 @@ pub struct PolymarketWorker {
     pub ctx: egui::Context,
     pub clob_client: Arc<Mutex<Option<ClobClient<Authenticated<Normal>>>>>, // persistent client
     pub poll_config: SharedPollConfig,
+    pub market_tasks:
+        Arc<
+            tokio::sync::Mutex<
+                HashMap<u64, MarketFeedHandle>
+            >
+        >,
 }
 
 impl PolymarketWorker {
@@ -1445,6 +1454,104 @@ impl PolymarketWorker {
                         ctx.request_repaint();
                     });    
                 }
+
+                UiCommand::StartMarketFeed {
+                    window_ts,
+                    slug,
+                } => {
+
+                    let mut tasks =
+                        self.market_tasks.lock().await;
+
+                    if tasks.contains_key(&window_ts) {
+                        tracing::info!("Feed already running for window {}", window_ts);
+                            //return;
+                            //break;
+                            continue;
+                    }
+
+                    let shutdown =
+                        Arc::new(tokio::sync::Notify::new());
+
+                    let prices: SharedMarketPrices =
+                        Arc::new(
+                            ArcSwap::from_pointee(
+                                MarketPrices {
+
+                                    up_price: 0.0,
+                                    down_price: 0.0,
+
+                                    up_asset_id:
+                                        Arc::<str>::from(""),
+
+                                    down_asset_id:
+                                        Arc::<str>::from(""),
+
+                                    connected: false,
+                                    stale: true,
+
+                                    last_ts: 0,
+
+                                    error: None,
+                                }
+                            )
+                        );
+
+                    let handle =
+                        MarketFeedHandle {
+                            shutdown: shutdown.clone(),
+                        };
+
+                    tasks.insert(
+                        window_ts,
+                        handle.clone(),
+                    );
+
+                    // ---------------------------------------------------
+                    // SEND ARC SWAP HANDLE TO UI
+                    // ---------------------------------------------------
+                    let _ = self.update_tx.send(
+                        WorkerUpdate::MarketFeedStarted {
+                            window_ts,
+                            prices: prices.clone(),
+                        }
+                    ).await;
+
+                    let gamma =
+                        GammaClient::default();
+
+                    spawn_market_feed(
+                        slug,
+                        prices,
+                        shutdown,
+                        gamma,
+                    )
+                    .await;
+
+                    info!(
+                        "market feed started: {}",
+                        window_ts
+                    );
+                }
+
+                UiCommand::StopMarketFeed {
+                    window_ts,
+                } => {
+
+                    let mut tasks =
+                        self.market_tasks.lock().await;
+
+                    if let Some(feed) =
+                        tasks.remove(&window_ts)
+                    {
+                        feed.shutdown.notify_waiters();
+
+                        info!(
+                            "market feed stopped: {}",
+                            window_ts
+                        );
+                    }
+                }
             }
         }
         tracing::warn!("Worker command channel was dropped/closed.");
@@ -1582,7 +1689,7 @@ async fn get_or_fetch_token_ids(client: &GammaClient, slug: &str) -> anyhow::Res
     Ok(token_ids)
 }
 */
-async fn get_or_fetch_token_ids(
+pub async fn get_or_fetch_token_ids(
     client: &GammaClient,
     slug: &str,
 ) -> anyhow::Result<Vec<String>> {

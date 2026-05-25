@@ -322,6 +322,15 @@ pub struct Event {
     pub home_team_name: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeeSchedule {
+    pub exponent: Option<i32>,
+    pub rate: Option<Decimal>,
+    pub rebate_rate: Option<Decimal>,
+    pub taker_only: Option<bool>,
+}
+
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
@@ -484,6 +493,8 @@ pub struct Market {
     pub approved: Option<bool>,
     pub cyom: Option<bool>,
     pub fees_enabled: Option<bool>,
+    pub fee_schedule: Option<FeeSchedule>,
+    pub fee_type: Option<String>,
     pub holding_rewards_enabled: Option<bool>,
     pub neg_risk: Option<bool>,
     #[serde_as(as = "NoneAsEmptyString")]

@@ -1,6 +1,7 @@
 use std::time::Instant;
 use crate::worker_config::Queue;
 use polybot_sdk_v2::clob::types::response::{OpenOrderResponse};
+use crate::market_data::{SharedMarketPrices, MarketFeedHandle};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LocalOrderStatus {
@@ -76,6 +77,9 @@ pub struct WindowGroup {
     pub slug: String,
     pub is_expanded: bool,
     pub orders: Vec<TrackedOrder>,
+
+    pub market_prices: Option<SharedMarketPrices>,
+    pub market_feed: Option<MarketFeedHandle>,
 }
 
 // Bounded UI Input signals passed from egui down to your network service worker
@@ -115,6 +119,14 @@ pub enum UiCommand {
     CancelAllInWindow {
         window_ts: u64,
     },
+    StartMarketFeed {
+        window_ts: u64,
+        slug: String,
+    },
+
+    StopMarketFeed {
+        window_ts: u64,
+    },
 }
 
 // Responses broadcast back from the background engine worker up to the UI state layer
@@ -133,6 +145,10 @@ pub enum WorkerUpdate {
     Notify {
         message: String,
         kind: NotificationKind,
+    },
+    MarketFeedStarted {
+        window_ts: u64,
+        prices: SharedMarketPrices,
     },
 }
 

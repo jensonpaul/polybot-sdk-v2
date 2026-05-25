@@ -1,3 +1,4 @@
+pub mod theme;
 pub mod auth_gateway;
 pub mod order_forms;
 pub mod window_matrix;
@@ -47,6 +48,9 @@ pub struct PolymarketDashboardApp {
     
     pub interval_inputs: IntervalInputs,
     pub poll_config: SharedPollConfig,
+
+    pub active_feed_window: Option<u64>,
+    pub feed_started_for: std::collections::HashSet<u64>,
 
     // Limit Order State Variables
     pub limit_side_buy: bool,
@@ -100,6 +104,8 @@ impl PolymarketDashboardApp {
                 rapid_sell: poll_config.get(Queue::RapidSell).to_string(),
             },
             poll_config,
+            active_feed_window: None,
+            feed_started_for: std::collections::HashSet::new(),
             limit_side_buy: true,
             limit_token_up: true,
             limit_price: "0.50".to_string(),
@@ -145,6 +151,9 @@ impl eframe::App for PolymarketDashboardApp {
                             slug: build_slug_for_timestamp(window_ts),
                             is_expanded: true,
                             orders: vec![order],
+
+                            market_prices: None,
+                            market_feed: None,
                         });
                     }
                 }
@@ -163,6 +172,20 @@ impl eframe::App for PolymarketDashboardApp {
                 WorkerUpdate::Notify { message, kind } => {
                     self.push_toast(message, kind);
                 }
+                WorkerUpdate::MarketFeedStarted {
+                    window_ts,
+                    prices,
+                } => {
+
+                    if let Some(window) =
+                        self.windows
+                            .iter_mut()
+                            .find(|w| w.timestamp_5m == window_ts)
+                    {
+                        window.market_prices =
+                            Some(prices);
+                    }
+                }
             }
         }
 
@@ -176,6 +199,7 @@ impl eframe::App for PolymarketDashboardApp {
         }
 
         let current_ts = initiate_stamp_5m();
+        let slug = build_slug_for_timestamp(current_ts);
         let current_time_raw = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let time_remaining = 300 - (current_time_raw % 300);
 
@@ -183,9 +207,19 @@ impl eframe::App for PolymarketDashboardApp {
         if !self.windows.iter().any(|w| w.timestamp_5m == current_ts) {
             self.windows.insert(0, WindowGroup {
                 timestamp_5m: current_ts,
-                slug: build_slug_for_timestamp(current_ts),
+                slug: slug.clone(),
                 is_expanded: true,
                 orders: Vec::new(),
+                market_prices: None,
+                market_feed: None,
+            });
+        }
+
+        // SINGLE feed start guard
+        if self.feed_started_for.insert(current_ts) {
+            let _ = self.cmd_tx.try_send(UiCommand::StartMarketFeed {
+                window_ts: current_ts,
+                slug,
             });
         }
 
@@ -243,7 +277,10 @@ impl eframe::App for PolymarketDashboardApp {
         });
 
         if self.auto_refresh_active {
-            ctx.request_repaint_after(Duration::from_millis(500));
+            //ctx.request_repaint_after(Duration::from_millis(500));
+            ctx.request_repaint_after(
+                Duration::from_millis(33)
+            );
         }
     }
 }

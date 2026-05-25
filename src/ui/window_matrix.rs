@@ -1,6 +1,7 @@
 use crate::ui::PolymarketDashboardApp;
 use crate::ui_types::{LocalOrderStatus, UiCommand};
 use eframe::egui;
+use crate::ui::theme::Theme;
 
 impl PolymarketDashboardApp {
     pub fn render_lifecycle_matrix(&mut self, ui: &mut egui::Ui) {
@@ -22,11 +23,24 @@ impl PolymarketDashboardApp {
                 if ui.button(if window.is_expanded { "🔽" } else { "▶" }).clicked() {
                     window.is_expanded = !window.is_expanded;
                 }
-                ui.label(&header_title);
+                ui.colored_label(
+                    Theme::TEXT_PRIMARY,
+
+                    egui::RichText::new(&header_title)
+                        .strong()
+                        .size(15.0),
+                );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("❌ Close Frame").clicked() {
                         windows_to_remove.push(w_idx);
+                        /*
+                        let _ = self.cmd_tx.try_send(
+                            UiCommand::StopMarketFeed {
+                                window_ts: window.timestamp_5m,
+                            }
+                        );
+                        */
                     }
                     if ui.button("🛑 Cancel Window Orders").clicked() {
                         let _ = self.cmd_tx.try_send(UiCommand::CancelAllInWindow {
@@ -36,54 +50,179 @@ impl PolymarketDashboardApp {
                 });
             });
 
+            if let Some(prices) = &window.market_prices {
+                let snap = prices.load();
+
+                ui.horizontal(|ui| {
+
+                    egui::Frame::none()
+                        .fill(Theme::BUY_GREEN_BG)
+                        .stroke(
+                            egui::Stroke::new(
+                                1.0,
+                                Theme::BUY_GREEN
+                            )
+                        )
+                        .corner_radius(6.0)
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+
+                            ui.label(
+                                egui::RichText::new(
+                                    format!(
+                                        "▲ UP {:.3}",
+                                        snap.up_price
+                                    )
+                                )
+                                .strong()
+                                .color(Theme::BUY_GREEN)
+                            );
+                        });
+
+                    egui::Frame::none()
+                        .fill(Theme::SELL_RED_BG)
+                        .stroke(
+                            egui::Stroke::new(
+                                1.0,
+                                Theme::SELL_RED
+                            )
+                        )
+                        .corner_radius(6.0)
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+
+                            ui.label(
+                                egui::RichText::new(
+                                    format!(
+                                        "▼ DOWN {:.3}",
+                                        snap.down_price
+                                    )
+                                )
+                                .strong()
+                                .color(Theme::SELL_RED)
+                            );
+                        });
+
+                    if snap.stale {
+                        ui.colored_label(
+                            Theme::WARNING,
+                            "● STALE"
+                        );
+                    }
+
+                    if !snap.connected {
+                        ui.colored_label(
+                            Theme::SELL_RED,
+                            "● DISCONNECTED"
+                        );
+                    }
+                });
+            }
+
             if window.is_expanded {
                 ui.indent(format!("window_indent_{}", window.timestamp_5m), |ui| {
                     if window.orders.is_empty() {
                         ui.label("No structural logs found inside this localized window iteration frame container.");
                     } else {
                         for order in window.orders.iter_mut() {
-                            /*
-                            let frame_color = match &order.status {
-                                LocalOrderStatus::FullyFilled => egui::Color32::from_rgba_unmultiplied(20, 120, 20, 30),
-                                LocalOrderStatus::PartiallyFilled { .. } => egui::Color32::from_rgba_unmultiplied(140, 130, 10, 30),
-                                LocalOrderStatus::Canceled => egui::Color32::from_rgba_unmultiplied(70, 70, 70, 30),
-                                LocalOrderStatus::Failed(_) => egui::Color32::from_rgba_unmultiplied(120, 20, 20, 30),
-                                _ => egui::Color32::from_rgba_unmultiplied(30, 30, 30, 30),
-                            };
-                            */
+                            let (fill, border) = match &order.status {
 
-                            let frame_color = match &order.status {
-                                LocalOrderStatus::Canceled => egui::Color32::from_rgba_unmultiplied(80, 80, 80, 40),
-                                LocalOrderStatus::Failed(_) => egui::Color32::from_rgba_unmultiplied(140, 40, 40, 50),
+                                LocalOrderStatus::Canceled => (
+                                    egui::Color32::from_rgba_unmultiplied(
+                                        90,
+                                        90,
+                                        90,
+                                        35,
+                                    ),
+
+                                    egui::Color32::from_rgb(
+                                        120,
+                                        120,
+                                        120,
+                                    ),
+                                ),
+
+                                LocalOrderStatus::Failed(_) => (
+                                    egui::Color32::from_rgba_unmultiplied(
+                                        180,
+                                        40,
+                                        40,
+                                        40,
+                                    ),
+
+                                    Theme::SELL_RED,
+                                ),
+
                                 _ => {
-                                    match order.side.to_lowercase().as_str() {
-                                        "sell" => egui::Color32::from_rgba_unmultiplied(70, 100, 140, 45), // muted blue
-                                        "buy" => match order.token.to_lowercase().as_str() {
-                                            "up" => egui::Color32::from_rgba_unmultiplied(60, 130, 60, 45),   // muted green
-                                            "down" => egui::Color32::from_rgba_unmultiplied(140, 50, 50, 45), // muted red
-                                            _ => egui::Color32::from_rgba_unmultiplied(60, 60, 60, 35),       // fallback
-                                        },
-                                        _ => egui::Color32::from_rgba_unmultiplied(40, 40, 40, 25),       // fallback
+
+                                    match (
+                                        order.side.to_lowercase().as_str(),
+                                        order.token.to_lowercase().as_str(),
+                                    ) {
+
+                                        ("buy", "up") => (
+                                            Theme::BUY_GREEN_BG,
+                                            Theme::BUY_GREEN,
+                                        ),
+
+                                        ("buy", "down") => (
+                                            Theme::SELL_RED_BG,
+                                            Theme::SELL_RED,
+                                        ),
+
+                                        ("sell", _) => (
+                                            Theme::BLUE_BG,
+                                            Theme::BLUE,
+                                        ),
+
+                                        _ => (
+                                            Theme::BG_ELEVATED,
+                                            Theme::BORDER,
+                                        ),
                                     }
                                 }
                             };
 
                             egui::Frame::none()
-                                .fill(frame_color)
-                                .stroke(egui::Stroke::new(
-                                    1.0,
-                                    egui::Color32::from_gray(90),
-                                ))
+                                .fill(fill)
+                                .stroke(
+                                    egui::Stroke::new(
+                                        1.0,
+                                        border,
+                                    )
+                                )
                                 .corner_radius(4.0)
-                                .inner_margin(6.0)
+                                .inner_margin(10.0)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(format!(
-                                            "[ID: {}] Side: {} | Token: {} | Price: {} | Size: {}",
-                                            order.id, order.side, order.token, order.price, order.size
-                                        ));
-                                        ui.separator();
-                                        ui.label(format!("Matched Fill Size Indicator: {}", order.size_matched));
+                                        ui.label(
+                                            egui::RichText::new(
+                                                format!(
+                                                    "[ID: {}] Side: {} | Token: {} | Price: {} | Size: {}",
+                                                    order.id, 
+                                                    order.side, 
+                                                    order.token, 
+                                                    order.price, 
+                                                    order.size
+                                                )
+                                            )
+                                            .monospace()
+                                            .color(Theme::TEXT_PRIMARY)
+                                            .strong()
+                                        );
+                                        //ui.separator();
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            egui::RichText::new(
+                                                format!(
+                                                    "Matched: {}", 
+                                                    order.size_matched
+                                                )
+                                            )
+                                            .monospace()
+                                            .color(Theme::TEXT_PRIMARY)
+                                            .strong()
+                                        );
 
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             if ui.button("🗑️ Cancel").clicked() {
@@ -103,7 +242,13 @@ impl PolymarketDashboardApp {
 
                                     if order.side.to_lowercase() == "buy" && order.size_matched != "0" {
                                         ui.horizontal(|ui| {
-                                            ui.small("⚡ Inline Position Mitigation Desk:");
+                                            ui.label(
+
+                                                egui::RichText::new(
+                                                    "⚡ Inline Position Mitigation Desk"
+                                                )
+                                                .color(Theme::BLUE)
+                                            );
 
                                             // --- Limit Sell Section ---
                                             ui.small("Price:");
@@ -143,7 +288,7 @@ impl PolymarketDashboardApp {
                                         });
                                     }
                                 });
-                            ui.add_space(2.0);
+                            ui.add_space(6.0);
                         }
                     }
                 });
