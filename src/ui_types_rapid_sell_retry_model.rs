@@ -24,12 +24,25 @@ pub enum LocalOrderStatus {
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum RapidSellState {
     Idle,
+
     Pending,
+
     Completed,
-    Failed(String),
+
+    // retryable failure
+    Failed {
+        reason: String,
+        retry_count: u32,
+        next_retry_at: std::time::Instant,
+    },
+
+    // permanent failure
+    Disabled {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +64,7 @@ pub struct TrackedOrder {
     pub open_order_response: Option<OpenOrderResponse>,
     pub rapid_sell_state: RapidSellState,
     pub window_ts: u64,
+    pub rapid_sell_attempts: u8,
 }
 
 #[derive(Clone, Debug)]
