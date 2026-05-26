@@ -57,8 +57,12 @@ async fn main() -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions {
         //renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
+            /*
             .with_inner_size([1100.0, 750.0])
             .with_min_inner_size([800.0, 500.0]),
+            */
+            .with_inner_size([1600.0, 950.0])
+            .with_min_inner_size([1200.0, 700.0]),
         ..Default::default()
     };
 
@@ -83,10 +87,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 3. Kick off native engine runtime loops
     eframe::run_native(
-        "Polymarket SDK Controller App Console",
+        "Polymarket Trading Terminal",
         native_options,
         Box::new(move |cc| {
             
+            /*
             cc.egui_ctx.set_visuals(
                 egui::Visuals::dark()
             );
@@ -101,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
                 8.0.into();
 
             cc.egui_ctx.set_style(style);
+            */
 
             // Update the worker with the valid runtime UI context instance
             worker.ctx = cc.egui_ctx.clone();
