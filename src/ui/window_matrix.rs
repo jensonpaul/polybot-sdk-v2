@@ -452,8 +452,13 @@ impl PolymarketDashboardApp {
                                             // INLINE EXIT DESK
                                             // =====================================================
 
-                                            if order.side.to_lowercase() == "buy"
-                                                && order.size_matched != "0"
+                                            if order.side.eq_ignore_ascii_case("buy")
+                                                && order
+                                                    .size_matched
+                                                    .trim()
+                                                    .parse::<f64>()
+                                                    .map(|n| n > 0.0)
+                                                    .unwrap_or(false)
                                             {
 
                                                 ui.add_space(8.0);

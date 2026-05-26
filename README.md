@@ -202,3 +202,23 @@ pub struct Market {
     pub neg_risk: Option<bool>,
     ...
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventMetadata {
+    pub price_to_beat: Option<Decimal>,
+}
+
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct Event {
+    ...
+    pub automatically_active: Option<bool>,
+    pub event_date: Option<NaiveDate>,
+    pub event_metadata: Option<EventMetadata>,
+    pub start_time: Option<DateTime<Utc>>,
+    pub event_week: Option<i32>,
+    ...
+}

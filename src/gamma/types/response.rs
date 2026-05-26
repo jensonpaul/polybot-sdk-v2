@@ -208,6 +208,12 @@ pub struct Collection {
     pub header_image_optimized: Option<ImageOptimization>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventMetadata {
+    pub price_to_beat: Option<Decimal>,
+}
+
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
@@ -285,6 +291,7 @@ pub struct Event {
     pub enable_neg_risk: Option<bool>,
     pub automatically_active: Option<bool>,
     pub event_date: Option<NaiveDate>,
+    pub event_metadata: Option<EventMetadata>,
     pub start_time: Option<DateTime<Utc>>,
     pub event_week: Option<i32>,
     pub series_slug: Option<String>,
