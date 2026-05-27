@@ -348,6 +348,17 @@ impl eframe::App for PolymarketDashboardApp {
                                 round_to_two_dp(
                                     &matched
                                 );
+
+                            o.executed_size = Some(matched.clone());
+
+                            if let Some(order_response) = &o.open_order_response {
+
+                                o.executed_price = Some(
+                                    round_to_two_dp(
+                                        &order_response.price.to_string()
+                                    )
+                                );
+                            }
                         }
                     }
                 }
