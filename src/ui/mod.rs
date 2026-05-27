@@ -323,6 +323,7 @@ impl eframe::App for PolymarketDashboardApp {
                     order_id,
                     status,
                     matched,
+                    open_order_response,
                 } => {
 
                     if let Some(w) =
@@ -351,13 +352,14 @@ impl eframe::App for PolymarketDashboardApp {
 
                             o.executed_size = Some(matched.clone());
 
-                            if let Some(order_response) = &o.open_order_response {
-
+                            if let Some(order_response) = open_order_response {
                                 o.executed_price = Some(
                                     round_to_two_dp(
                                         &order_response.price.to_string()
                                     )
                                 );
+
+                                o.open_order_response = Some(order_response);
                             }
                         }
                     }

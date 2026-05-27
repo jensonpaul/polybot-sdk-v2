@@ -143,6 +143,7 @@ pub enum WorkerUpdate {
         order_id: String,
         status: LocalOrderStatus,
         matched: String,
+        open_order_response: Option<OpenOrderResponse>,
     },
     Notify {
         message: String,

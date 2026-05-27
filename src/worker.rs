@@ -316,6 +316,7 @@ impl PolymarketWorker {
                                 order_id: order_id.clone(),
                                 status: target_status.clone(),
                                 matched: order_info.size_matched.to_string(),
+                                open_order_response: Some(order_info.clone()),
                             })
                             .await;
 
@@ -1349,6 +1350,7 @@ impl PolymarketWorker {
                                     order_id: order_id.clone(),
                                     status: target_status.clone(),
                                     matched: order_info.size_matched.to_string(),
+                                    open_order_response: Some(order_info.clone()),
                                 })
                                 .await;
 
@@ -1383,6 +1385,7 @@ impl PolymarketWorker {
                                             order_id: order_id.clone(),
                                             status: LocalOrderStatus::Canceled,
                                             matched: "Canceled".to_string(),
+                                            open_order_response: None,
                                         })
                                         .await;
 
@@ -1457,6 +1460,7 @@ impl PolymarketWorker {
                                                 order_id: order_id.clone(),
                                                 status: LocalOrderStatus::Canceled,
                                                 matched: "Canceled".to_string(),
+                                                open_order_response: None,
                                             })
                                             .await;
 
