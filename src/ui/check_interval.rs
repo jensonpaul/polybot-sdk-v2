@@ -13,98 +13,73 @@ impl PolymarketDashboardApp {
         queue: Queue,
     ) {
 
-        egui::Frame::none()
-            .fill(Theme::BG_ELEVATED)
-            .stroke(
-                egui::Stroke::new(
-                    1.0,
-                    Theme::BORDER
+        ui.horizontal(|ui| {
+
+            ui.label(
+                egui::RichText::new(label)
+                    .color(Theme::TEXT_MUTED)
+            );
+
+            ui.add_space(6.0);
+
+            let response = ui.add(
+
+                egui::TextEdit::singleline(
+                    self.interval_inputs.get_mut(queue)
                 )
-            )
-            .corner_radius(6.0)
-            .inner_margin(8.0)
-            .show(ui, |ui| {
+                .desired_width(70.0)
+            );
 
-                ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("ms")
+                    .color(Theme::TEXT_MUTED)
+            );
 
-                    ui.label(
-                        egui::RichText::new(label)
-                            .color(
-                                Theme::TEXT_MUTED
-                            )
-                    );
+            if response.lost_focus()
+                && ui.input(|i|
+                    i.key_pressed(egui::Key::Enter)
+                )
+            {
 
-                    let response =
-                        ui.add(
-                            egui::TextEdit::singleline(
-                                self.interval_inputs
-                                    .get_mut(queue)
-                            )
-                            .desired_width(80.0)
+                let value =
+                    self.interval_inputs.get(queue);
+
+                match value.parse::<u64>() {
+
+                    Ok(ms) => {
+
+                        let tx = self.cmd_tx.clone();
+
+                        tokio::spawn(async move {
+
+                            let _ =
+                                tx.try_send(
+                                    UiCommand::UpdatePollInterval {
+                                        milliseconds: ms,
+                                        queue,
+                                    }
+                                );
+                        });
+
+                        self.push_toast(
+                            format!(
+                                "{} updated to {} ms",
+                                label,
+                                ms
+                            ),
+                            NotificationKind::Success,
                         );
-
-                    ui.label(
-                        egui::RichText::new("ms")
-                            .color(
-                                Theme::TEXT_MUTED
-                            )
-                    );
-
-                    if response.lost_focus()
-                        && ui.input(|i|
-                            i.key_pressed(
-                                egui::Key::Enter
-                            )
-                        )
-                    {
-
-                        let value =
-                            self.interval_inputs
-                                .get(queue);
-
-                        match value.parse::<u64>() {
-
-                            Ok(ms) => {
-
-                                let tx =
-                                    self.cmd_tx.clone();
-
-                                tokio::spawn(async move {
-
-                                    let _ =
-                                        tx.try_send(
-                                            UiCommand::UpdatePollInterval {
-
-                                                milliseconds: ms,
-
-                                                queue,
-                                            }
-                                        );
-                                });
-
-                                self.push_toast(
-                                    format!(
-                                        "{} updated to {} ms",
-                                        label,
-                                        ms
-                                    ),
-
-                                    NotificationKind::Success,
-                                );
-                            }
-
-                            Err(_) => {
-
-                                self.push_toast(
-                                    "Invalid interval"
-                                        .to_string(),
-
-                                    NotificationKind::Error,
-                                );
-                            }
-                        }
                     }
-                });
-            });
+
+                    Err(_) => {
+
+                        self.push_toast(
+                            "Invalid interval".to_string(),
+                            NotificationKind::Error,
+                        );
+                    }
+                }
+            }
+        });
     }
 }

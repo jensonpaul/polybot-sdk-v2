@@ -331,6 +331,39 @@ impl PolymarketWorker {
                                 .size_matched
                                 .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero)
                                 .to_string();
+                            
+                            // -------------------------------------------------
+                            // UPDATE EXECUTION PRICE + SIZE
+                            // -------------------------------------------------
+
+                            // actual filled size
+                            o.executed_size = Some(
+                                order_info
+                                    .size_matched
+                                    .round_dp_with_strategy(
+                                        2,
+                                        rust_decimal::RoundingStrategy::ToZero
+                                    )
+                                    .to_string()
+                                );
+
+                            // execution price
+                            //
+                            // Polymarket average fill price:
+                            // amount matched / shares matched
+                            //
+                            if order_info.size_matched > Decimal::ZERO {
+
+                                o.executed_price = Some(
+                                    order_info
+                                        .price
+                                        .round_dp_with_strategy(
+                                            4,
+                                            rust_decimal::RoundingStrategy::ToZero
+                                        )
+                                        .to_string()
+                                    );
+                            }
 
                             o.is_trade_fully_confirmed =
                                 is_trade_fully_confirmed;
@@ -832,6 +865,12 @@ impl PolymarketWorker {
 
                                                 size:
                                                     sell_amount.to_string(),
+                                                
+                                                executed_price: 
+                                                    None,
+                                                
+                                                executed_size: 
+                                                    None,
 
                                                 status:
                                                     LocalOrderStatus::Open,
@@ -1080,6 +1119,8 @@ impl PolymarketWorker {
                                             token,
                                             price,
                                             size,
+                                            executed_price: None,
+                                            executed_size: None,
                                             status: LocalOrderStatus::Open,
                                             size_matched: "0".to_string(),
                                             inline_sell_price: "0.10".to_string(),
@@ -1174,8 +1215,14 @@ impl PolymarketWorker {
                                             token,
                                             price: "Market".into(),
                                             size: "Market".into(),
+                                            executed_price: None,
+                                            executed_size: None,
+                                            /*
                                             status: LocalOrderStatus::FullyFilled,
                                             size_matched: "Full".to_string(),
+                                            */
+                                            status: LocalOrderStatus::Open,
+                                            size_matched: "0".to_string(),
                                             inline_sell_price: "0.50".to_string(),
                                             inline_sell_size: "0".to_string(),
                                             inline_sell_market_type: "FAK".to_string(),

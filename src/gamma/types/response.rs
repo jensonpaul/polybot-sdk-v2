@@ -212,6 +212,7 @@ pub struct Collection {
 #[serde(rename_all = "camelCase")]
 pub struct EventMetadata {
     pub price_to_beat: Option<Decimal>,
+    pub final_price: Option<Decimal>,
 }
 
 #[serde_as]

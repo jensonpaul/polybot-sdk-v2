@@ -40,6 +40,8 @@ pub struct TrackedOrder {
     pub token: String,
     pub price: String,
     pub size: String,
+    pub executed_price: Option<String>,
+    pub executed_size: Option<String>,
     pub status: LocalOrderStatus,
     pub size_matched: String,
     pub inline_sell_price: String,

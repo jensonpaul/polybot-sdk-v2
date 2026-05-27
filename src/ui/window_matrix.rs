@@ -348,6 +348,16 @@ impl PolymarketDashboardApp {
 
                                         .show(ui, |ui| {
 
+                                                        let display_price =
+                                                            order.executed_price
+                                                                .as_deref()
+                                                                .unwrap_or(&order.price);
+
+                                                        let display_size =
+                                                            order.executed_size
+                                                                .as_deref()
+                                                                .unwrap_or(&order.size);
+
                                             // =====================================================
                                             // ORDER HEADER
                                             // =====================================================
@@ -359,12 +369,19 @@ impl PolymarketDashboardApp {
                                                     egui::RichText::new(
 
                                                         format!(
+                                                            /*
                                                             "[{}] {} {} @ {} x {}",
                                                             order.id,
+                                                            */
+                                                            "{} {} @ {} x {}",
                                                             order.side.to_uppercase(),
                                                             order.token.to_uppercase(),
+                                                            /*
                                                             order.price,
                                                             order.size,
+                                                            */
+                                                            display_price,
+                                                            display_size,
                                                         )
                                                     )
                                                     .monospace()
