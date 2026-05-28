@@ -8,9 +8,9 @@ use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
-use polybot_sdk_v2::clob::ws::Client as WsClient;
-use polybot_sdk_v2::gamma::Client as GammaClient;
-use polybot_sdk_v2::types::U256;
+use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
+use polymarket_client_sdk_v2::gamma::Client as GammaClient;
+use polymarket_client_sdk_v2::types::U256;
 
 use crate::worker::get_or_fetch_token_ids;
 

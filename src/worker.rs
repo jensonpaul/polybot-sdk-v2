@@ -23,21 +23,21 @@ use alloy::signers::local::LocalSigner;
 
 use lazy_static::lazy_static;
 
-use polybot_sdk_v2::auth::state::Authenticated;
-use polybot_sdk_v2::auth::{Credentials, Normal};
-use polybot_sdk_v2::clob::{Client as ClobClient, Config};
-use polybot_sdk_v2::clob::types::{Side, SignatureType, OrderType, OrderStatusType, TradeStatusType, Amount, TickSize};
-use polybot_sdk_v2::clob::types::request::{TradesRequest};
-use polybot_sdk_v2::clob::types::response::{PostOrderResponse, OpenOrderResponse, CancelOrdersResponse, TradeResponse};
-use polybot_sdk_v2::gamma::Client as GammaClient;
-use polybot_sdk_v2::gamma::types::request::MarketBySlugRequest;
-use polybot_sdk_v2::gamma::types::response::Market;
-use polybot_sdk_v2::types::{Address, Decimal, U256};
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::auth::{Credentials, Normal};
+use polymarket_client_sdk_v2::clob::{Client as ClobClient, Config};
+use polymarket_client_sdk_v2::clob::types::{Side, SignatureType, OrderType, OrderStatusType, TradeStatusType, Amount, TickSize};
+use polymarket_client_sdk_v2::clob::types::request::{TradesRequest};
+use polymarket_client_sdk_v2::clob::types::response::{PostOrderResponse, OpenOrderResponse, CancelOrdersResponse, TradeResponse};
+use polymarket_client_sdk_v2::gamma::Client as GammaClient;
+use polymarket_client_sdk_v2::gamma::types::request::MarketBySlugRequest;
+use polymarket_client_sdk_v2::gamma::types::response::Market;
+use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 
 use serde::Deserialize;
 use tracing::{info, instrument};
 
-pub use polybot_sdk_v2::error::Error;
+pub use polymarket_client_sdk_v2::error::Error;
 
 use arc_swap::ArcSwap;
 use crate::market_data::{MarketFeedHandle, MarketPrices, SharedMarketPrices, spawn_market_feed};
@@ -73,7 +73,7 @@ impl PolymarketWorker {
         let host = std::env::var("CLOB_API_URL").unwrap_or_else(|_| "https://clob.polymarket.com".into());
         let deposit_wallet = Address::from_str(&std::env::var("DEPOSIT_WALLET")?)?;
         
-        let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(polybot_sdk_v2::POLYGON));
+        let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
         let creds = get_or_fetch_api_creds(private_key.clone(), host.clone()).await?;
         
         let client = ClobClient::new(&host, Config::default())?
@@ -91,7 +91,7 @@ impl PolymarketWorker {
     /// Spawns a Tokio task with a locked `clob_client` instance.
     pub fn spawn_with_client<F, Fut>(&self, f: F)
     where
-        F: FnOnce(Client<polybot_sdk_v2::auth::state::Authenticated<polybot_sdk_v2::auth::Normal>>) -> Fut + Send + 'static,
+        F: FnOnce(Client<polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let clob_client = self.clob_client.clone();
@@ -1773,7 +1773,7 @@ pub fn get_or_fetch_api_creds(
                 return Ok(creds.clone());
             }
         }
-        let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(polybot_sdk_v2::POLYGON));
+        let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
         let client = ClobClient::new(&host, Config::default())?;
         let creds: Credentials = client.create_or_derive_api_key(&signer, None).await?;
         {
@@ -1794,7 +1794,7 @@ async fn place_order_limit(
     // Load signer
     let private_key = std::env::var("PRIVATE_KEY_VAR")?;
     let signer = LocalSigner::from_str(&private_key)?
-        .with_chain_id(Some(polybot_sdk_v2::POLYGON));
+        .with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
 
     // Fetch token IDs
     let gamma_client = GammaClient::default();
@@ -1858,7 +1858,7 @@ async fn place_order_market(
     target_slug: &str
 ) -> anyhow::Result<PostOrderResponse> {
     let private_key = std::env::var("PRIVATE_KEY_VAR")?;
-    let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(polybot_sdk_v2::POLYGON));
+    let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
 
     let gamma_client = GammaClient::default();
     let token_ids = get_or_fetch_token_ids(&gamma_client, target_slug).await?;

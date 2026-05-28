@@ -1,6 +1,6 @@
 use std::time::Instant;
 use crate::worker_config::Queue;
-use polybot_sdk_v2::clob::types::response::{OpenOrderResponse};
+use polymarket_client_sdk_v2::clob::types::response::{OpenOrderResponse};
 use crate::market_data::{SharedMarketPrices, MarketFeedHandle};
 
 #[derive(Clone, Debug, PartialEq)]
