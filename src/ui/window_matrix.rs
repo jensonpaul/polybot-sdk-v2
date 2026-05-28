@@ -348,15 +348,42 @@ impl PolymarketDashboardApp {
 
                                         .show(ui, |ui| {
 
-                                                        let display_price =
-                                                            order.executed_price
-                                                                .as_deref()
-                                                                .unwrap_or(&order.price);
+                                            let display_price =
+                                                order.executed_price
+                                                    .as_deref()
+                                                    .unwrap_or(&order.price);
 
-                                                        let display_size =
-                                                            order.executed_size
-                                                                .as_deref()
-                                                                .unwrap_or(&order.size);
+                                            let display_size =
+                                                order.executed_size
+                                                    .as_deref()
+                                                    .unwrap_or(&order.size);
+
+                                            /*
+                                            let display_size =
+                                                match order.executed_size.as_deref() {
+                                                    Some(size_str) => {
+                                                        let size_val: f64 =
+                                                            size_str.parse().unwrap_or(0.0);
+
+                                                        if size_val == 0.0 {
+                                                            &order.size
+                                                        } else {
+                                                            size_str
+                                                        }
+                                                    }
+                                                    None => &order.size,
+                                                };
+
+                                            let display_size =
+                                                match order.status {
+                                                    OrderStatus::FullyFilled
+                                                    | OrderStatus::PartiallyFilled => {
+                                                        order.executed_size.as_deref().unwrap_or(&order.size)
+                                                    }
+
+                                                    _ => &order.size,
+                                                };
+                                                */
 
                                             // =====================================================
                                             // ORDER HEADER
@@ -490,6 +517,7 @@ impl PolymarketDashboardApp {
 
                                                         ui.horizontal_wrapped(|ui| {
 
+                                                            /*
                                                             ui.label(
 
                                                                 egui::RichText::new(
@@ -500,21 +528,25 @@ impl PolymarketDashboardApp {
                                                                     Theme::BLUE
                                                                 )
                                                             );
+                                                            */
 
                                                             compact_input(
                                                                 ui,
                                                                 "Price",
                                                                 &mut order.inline_sell_price,
-                                                                60.0,
+                                                                //60.0,
+                                                                30.0,
                                                             );
 
                                                             compact_input(
                                                                 ui,
                                                                 "Size",
                                                                 &mut order.inline_sell_size,
-                                                                60.0,
+                                                                //60.0,
+                                                                40.0,
                                                             );
 
+                                                            /*
                                                             ui.radio_value(
                                                                 &mut order.inline_sell_market_type,
                                                                 "FAK".to_string(),
@@ -526,6 +558,7 @@ impl PolymarketDashboardApp {
                                                                 "FOK".to_string(),
                                                                 "FOK",
                                                             );
+                                                            */
 
                                                             if themed_button(
                                                                 ui,
@@ -587,11 +620,15 @@ impl PolymarketDashboardApp {
                                                                                     order.inline_sell_size.clone()
                                                                                 ),
 
+                                                                            /*
                                                                             order_type:
                                                                                 Some(
                                                                                     order.inline_sell_market_type.clone()
                                                                                 ),
-
+                                                                                */
+                                                                            order_type: 
+                                                                                Some("FAK".to_string()),
+                                                                                
                                                                             window_ts:
                                                                                 window.timestamp_5m,
                                                                         }

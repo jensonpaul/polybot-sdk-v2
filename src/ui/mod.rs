@@ -342,6 +342,7 @@ impl eframe::App for PolymarketDashboardApp {
                         {
                             o.status = status;
 
+                            /*
                             o.size_matched =
                                 matched.clone();
 
@@ -350,7 +351,20 @@ impl eframe::App for PolymarketDashboardApp {
                                     &matched
                                 );
 
-                            o.executed_size = Some(matched.clone());
+                            o.executed_size = 
+                                Some(matched.clone());
+                                */
+
+                            let matched_val: f64 = matched.parse().unwrap_or(0.0);
+
+                            if matched_val > 0.0 {
+                                o.executed_size = Some(matched.clone());
+                                o.size_matched = matched.clone();
+                                o.inline_sell_size = round_to_two_dp(&matched);
+                            } else {
+                                // explicitly keep it None for "no fill"
+                                o.executed_size = None;
+                            }
 
                             if let Some(order_response) = open_order_response {
                                 o.executed_price = Some(
