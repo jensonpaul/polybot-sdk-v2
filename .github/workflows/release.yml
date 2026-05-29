@@ -1,0 +1,76 @@
+name: polybot release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 🔥 fastest Rust cache available
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Linux release
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/polybot dist/polybot-linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/
+
+  windows-msvc:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Rust MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # 🔥 speeds up crypto/TLS builds significantly
+      - name: Set env optimizations
+        run: echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> $env:GITHUB_ENV
+
+      - name: Build Windows MSVC
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        run: |
+          mkdir dist
+          copy target\x86_64-pc-windows-msvc\release\polybot.exe dist\polybot-windows.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/
+
+  release:
+    needs: [linux, windows-msvc]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "**/*"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
