@@ -231,6 +231,11 @@ impl eframe::App for PolymarketDashboardApp {
         // ------------------------------------------------------------------
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
+                WorkerEvent::WindowClosed { window_ts } => {
+                    // Remove the window from UI now that worker has cleaned up
+                    self.windows.retain(|w| w.timestamp_5m != window_ts);
+                    self.feed_started_for.remove(&window_ts);
+                }
                 WorkerEvent::Notify { message, kind } => {
                     self.push_toast(message, kind);
                 }

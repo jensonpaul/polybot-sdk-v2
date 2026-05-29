@@ -420,6 +420,46 @@ impl PolymarketWorker {
                         info!(window_ts, "feed stopped");
                     }
                 }
+
+                UiCommand::CloseWindow { window_ts } => {
+                    // ---------------------------------------------------------
+                    // Stop feed
+                    // ---------------------------------------------------------
+                    if let Some((_, handle)) = state.market_feeds.remove(&window_ts) {
+                        handle.shutdown.notify_waiters();
+                    }
+
+                    // ---------------------------------------------------------
+                    // Remove market snapshot
+                    // ---------------------------------------------------------
+                    state.market_prices.remove(&window_ts);
+
+                    // ---------------------------------------------------------
+                    // Remove orders + associated trades
+                    // ---------------------------------------------------------
+                    let order_ids: Vec<String> = state
+                        .orders
+                        .iter()
+                        .filter(|entry| entry.value().window_ts == window_ts)
+                        .map(|entry| entry.key().clone())
+                        .collect();
+
+                    for order_id in order_ids {
+                        if let Some((_, order)) = state.orders.remove(&order_id) {
+                            for trade_id in &order.associate_trades {
+                                state.trades.remove(trade_id);
+                            }
+                        }
+                    }
+
+                    state.touch();
+                    ctx.request_repaint();
+
+                    // ---------------------------------------------------------
+                    // Notify UI
+                    // ---------------------------------------------------------
+                    let _ = self.event_tx.send(WorkerEvent::WindowClosed { window_ts }).await;
+                }
             }
         }
 

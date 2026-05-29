@@ -64,6 +64,8 @@ pub enum UiCommand {
 
     /// Stop and discard the feed for a window.
     StopMarketFeed { window_ts: u64 },
+
+    CloseWindow { window_ts: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -82,4 +84,6 @@ pub enum WorkerEvent {
     /// [`crate::state::SharedMarketPrices`] has been written into
     /// `AppState::market_prices[window_ts]`.
     MarketFeedStarted { window_ts: u64 },
+
+    WindowClosed { window_ts: u64 },
 }

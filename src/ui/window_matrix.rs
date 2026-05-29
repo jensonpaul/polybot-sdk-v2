@@ -27,7 +27,7 @@ impl PolymarketDashboardApp {
 
         ui.add_space(10.0);
 
-        let mut windows_to_remove = Vec::new();
+        //let mut windows_to_remove: Vec<(usize, u64, Vec<String>)> = Vec::new();
 
         for (w_idx, window) in self.windows.iter_mut().enumerate() {
             panel_frame().show(ui, |ui| {
@@ -63,7 +63,10 @@ impl PolymarketDashboardApp {
                             if themed_button(ui, "CLOSE", Theme::SELL_RED_BG, Theme::SELL_RED)
                                 .clicked()
                             {
-                                windows_to_remove.push(w_idx);
+                                //windows_to_remove.push((w_idx, window.timestamp_5m, window.order_ids.clone()));
+                                let _ = self.cmd_tx.try_send(UiCommand::CloseWindow {
+                                    window_ts: window.timestamp_5m,
+                                });
                             }
 
                             if themed_button(
@@ -195,11 +198,30 @@ impl PolymarketDashboardApp {
             ui.add_space(10.0);
         }
 
+        /*
         // Remove closed windows (descending index to avoid shifting).
-        windows_to_remove.sort_by(|a, b| b.cmp(a));
-        for idx in windows_to_remove {
+        windows_to_remove.sort_by(|a, b| b.0.cmp(&a.0));
+        for (idx, window_ts, order_ids) in windows_to_remove {
+            // Stop the background market feed task.
+            let _ = self.cmd_tx.try_send(UiCommand::StopMarketFeed { window_ts });
+            self.feed_started_for.remove(&window_ts);
+
+            // Remove market snapshot
+            self.state.market_prices.remove(&window_ts);
+
+            // Purge orders and their associated trades from shared state.
+            for id in &order_ids {
+                if let Some((_, order)) = self.state.orders.remove(id) {
+                    for trade_id in &order.associate_trades {
+                        self.state.trades.remove(trade_id);
+                    }
+                }
+            }
+
+            self.state.touch();
             self.windows.remove(idx);
         }
+        */
     }
 
     fn render_order_column(
