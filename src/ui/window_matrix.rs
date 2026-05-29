@@ -10,7 +10,9 @@ use crate::ui::PolymarketDashboardApp;
 
 use crate::ui_types::{
     LocalOrderStatus,
+    TrackedOrder,
     UiCommand,
+    WindowGroup,
 };
 
 use eframe::egui;
@@ -109,45 +111,36 @@ impl PolymarketDashboardApp {
 
                             |ui| {
 
-                                //let desired_width = 120.0;
-                                let desired_width = ui.available_width().clamp(120.0, 200.0);
+                                if themed_button(
+                                    ui,
+                                    "CLOSE",
+                                    Theme::SELL_RED_BG,
+                                    Theme::SELL_RED,
+                                )
+                                .clicked()
+                                {
+                                    windows_to_remove
+                                        .push(w_idx);
+                                }
 
-                                ui.allocate_ui(egui::vec2(desired_width, 0.0), |ui| {
+                                if themed_button(
+                                    ui,
+                                    "CANCEL ALL",
+                                    Theme::SELL_RED_BG,
+                                    Theme::SELL_RED,
+                                )
+                                .clicked()
+                                {
+                                    let _ =
+                                        self.cmd_tx.try_send(
 
-                                    ui.horizontal(|ui| {
+                                            UiCommand::CancelAllInWindow {
 
-                                        if themed_button(
-                                            ui,
-                                            "CLOSE",
-                                            Theme::SELL_RED_BG,
-                                            Theme::SELL_RED,
-                                        )
-                                        .clicked()
-                                        {
-                                            windows_to_remove
-                                                .push(w_idx);
-                                        }
-
-                                        if themed_button(
-                                            ui,
-                                            "CANCEL ALL",
-                                            Theme::SELL_RED_BG,
-                                            Theme::SELL_RED,
-                                        )
-                                        .clicked()
-                                        {
-                                            let _ =
-                                                self.cmd_tx.try_send(
-
-                                                    UiCommand::CancelAllInWindow {
-
-                                                        window_ts:
-                                                            window.timestamp_5m,
-                                                    }
-                                                );
-                                        }
-                                    });
-                                });
+                                                window_ts:
+                                                    window.timestamp_5m,
+                                            }
+                                        );
+                                }
                             }
                         );
                     });
@@ -171,7 +164,7 @@ impl PolymarketDashboardApp {
 
                         ui.add_space(8.0);
 
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
 
                             panel_frame()
                                 .fill(
@@ -255,384 +248,118 @@ impl PolymarketDashboardApp {
 
                     if window.is_expanded {
 
-                        ui.add_space(8.0);
+                        ui.add_space(12.0);
 
-                        egui::ScrollArea::vertical()
+                        // =====================================================
+                        // SPLIT ORDERS
+                        // =====================================================
 
-                            .id_salt(
+                        let mut bought =
+                            Vec::<usize>::new();
 
-                                format!(
-                                    "orders_scroll_{}",
-                                    window.timestamp_5m
-                                )
-                            )
+                        let mut sold =
+                            Vec::<usize>::new();
 
-                            .max_height(450.0)
+                        let mut others =
+                            Vec::<usize>::new();
 
-                            .auto_shrink([false; 2])
+                        for (
+                            idx,
+                            order
+                        ) in window.orders
+                            .iter()
+                            .enumerate()
+                        {
 
-                            .show(ui, |ui| {
+                            let side =
+                                order.side
+                                    .to_lowercase();
 
-                                for order in
-                                    window.orders.iter_mut()
-                                {
+                            let invalid_status =
+                                matches!(
+                                    order.status,
 
-                                    let (
-                                        fill,
-                                        border
-                                    ) = match &order.status {
+                                    LocalOrderStatus::Canceled
+                                    | LocalOrderStatus::Failed(_)
+                                );
 
-                                        LocalOrderStatus::Canceled => (
+                            if invalid_status {
 
-                                            egui::Color32::from_rgba_unmultiplied(
-                                                90,
-                                                90,
-                                                90,
-                                                35,
-                                            ),
+                                others.push(idx);
 
-                                            egui::Color32::from_rgb(
-                                                120,
-                                                120,
-                                                120,
-                                            ),
-                                        ),
+                                continue;
+                            }
 
-                                        LocalOrderStatus::Failed(_) => (
+                            match side.as_str() {
 
-                                            Theme::SELL_RED_BG,
+                                "buy" =>
+                                    bought.push(idx),
 
-                                            Theme::SELL_RED,
-                                        ),
+                                "sell" =>
+                                    sold.push(idx),
 
-                                        _ => {
+                                _ =>
+                                    others.push(idx),
+                            }
+                        }
 
-                                            match (
-                                                order.side.to_lowercase().as_str(),
-                                                order.token.to_lowercase().as_str(),
-                                            ) {
+                        // =====================================================
+                        // RESPONSIVE 3 COLUMN LAYOUT
+                        // =====================================================
 
-                                                ("buy", "up") => (
+                        ui.columns(3, |columns| {
 
-                                                    Theme::BUY_GREEN_BG,
+                            // =====================================================
+                            // BOUGHT
+                            // =====================================================
 
-                                                    Theme::BUY_GREEN,
-                                                ),
+                            Self::render_order_column(
 
-                                                ("buy", "down") => (
+                                &mut columns[0],
 
-                                                    Theme::SELL_RED_BG,
+                                "🟢 BOUGHT",
 
-                                                    Theme::SELL_RED,
-                                                ),
+                                &bought,
 
-                                                ("sell", _) => (
+                                window,
 
-                                                    Theme::BLUE_BG,
+                                &self.cmd_tx,
+                            );
 
-                                                    Theme::BLUE,
-                                                ),
+                            // =====================================================
+                            // SOLD
+                            // =====================================================
 
-                                                _ => (
+                            Self::render_order_column(
 
-                                                    Theme::BG_ELEVATED,
+                                &mut columns[1],
 
-                                                    Theme::BORDER,
-                                                ),
-                                            }
-                                        }
-                                    };
+                                "🔵 SOLD",
 
-                                    panel_frame()
+                                &sold,
 
-                                        .fill(fill)
+                                window,
 
-                                        .stroke(
+                                &self.cmd_tx,
+                            );
 
-                                            egui::Stroke::new(
-                                                1.0,
-                                                border,
-                                            )
-                                        )
+                            // =====================================================
+                            // OTHERS
+                            // =====================================================
 
-                                        .show(ui, |ui| {
-
-                                            let display_price =
-                                                order.executed_price
-                                                    .as_deref()
-                                                    .unwrap_or(&order.price);
-
-                                            let display_size =
-                                                order.executed_size
-                                                    .as_deref()
-                                                    .unwrap_or(&order.size);
-
-                                            /*
-                                            let display_size =
-                                                match order.executed_size.as_deref() {
-                                                    Some(size_str) => {
-                                                        let size_val: f64 =
-                                                            size_str.parse().unwrap_or(0.0);
-
-                                                        if size_val == 0.0 {
-                                                            &order.size
-                                                        } else {
-                                                            size_str
-                                                        }
-                                                    }
-                                                    None => &order.size,
-                                                };
-
-                                            let display_size =
-                                                match order.status {
-                                                    LocalOrderStatus::FullyFilled
-                                                    | LocalOrderStatus::PartiallyFilled { .. } => {
-                                                        order.executed_size.as_deref().unwrap_or(&order.size)
-                                                    }
-
-                                                    _ => &order.size,
-                                                };
-                                                */
-
-                                            // =====================================================
-                                            // ORDER HEADER
-                                            // =====================================================
-
-                                            ui.horizontal(|ui| {
-
-                                                ui.label(
-
-                                                    egui::RichText::new(
-
-                                                        format!(
-                                                            /*
-                                                            "[{}] {} {} @ {} x {}",
-                                                            order.id,
-                                                            */
-                                                            "{} {} @ {} x {}",
-                                                            order.side.to_uppercase(),
-                                                            order.token.to_uppercase(),
-                                                            /*
-                                                            order.price,
-                                                            order.size,
-                                                            */
-                                                            display_price,
-                                                            display_size,
-                                                        )
-                                                    )
-                                                    .monospace()
-                                                    .strong()
-                                                    .color(
-                                                        Theme::TEXT_PRIMARY
-                                                    )
-                                                );
-
-                                                ui.separator();
-
-                                                ui.label(
-
-                                                    egui::RichText::new(
-
-                                                        format!(
-                                                            "MATCHED {}",
-                                                            order.size_matched
-                                                        )
-                                                    )
-                                                    .monospace()
-                                                    .color(
-                                                        Theme::TEXT_PRIMARY
-                                                    )
-                                                );
-
-                                                ui.add_space(8.0);
-
-                                                if matches!(
-                                                    order.status,
-                                                    LocalOrderStatus::Open 
-                                                    | LocalOrderStatus::PartiallyFilled { .. }
-                                                ) {
-                                                    if themed_button(
-                                                        ui,
-                                                        "CANCEL",
-                                                        Theme::SELL_RED_BG,
-                                                        Theme::SELL_RED,
-                                                    )
-                                                    .clicked()
-                                                    {
-
-                                                        let _ =
-                                                            self.cmd_tx.try_send(
-
-                                                                UiCommand::CancelIndividual {
-
-                                                                    order_id:
-                                                                        order.id.clone(),
-
-                                                                    window_ts:
-                                                                        window.timestamp_5m,
-                                                                }
-                                                            );
-                                                    }
-                                                }
-                                            });
-
-                                            // =====================================================
-                                            // INLINE EXIT DESK
-                                            // =====================================================
-
-                                            /*
-                                            if order.side.eq_ignore_ascii_case("buy")
-                                                && order
-                                                    .size_matched
-                                                    .trim()
-                                                    .parse::<f64>()
-                                                    .map(|n| n > 0.0)
-                                                    .unwrap_or(false)
-                                                    */
-                                            if matches!(
-                                                order.status,
-                                                LocalOrderStatus::FullyFilled 
-                                                | LocalOrderStatus::PartiallyFilled { .. }
-                                            ) && order.side.eq_ignore_ascii_case("buy")                                            
-                                            {
-
-                                                ui.add_space(8.0);
-
-                                                panel_frame()
-
-                                                    .fill(
-                                                        Theme::BG_PANEL
-                                                    )
-
-                                                    .show(ui, |ui| {
-
-                                                        ui.horizontal_wrapped(|ui| {
-
-                                                            /*
-                                                            ui.label(
-
-                                                                egui::RichText::new(
-                                                                    "INLINE EXIT DESK"
-                                                                )
-                                                                .strong()
-                                                                .color(
-                                                                    Theme::BLUE
-                                                                )
-                                                            );
-                                                            */
-
-                                                            compact_input(
-                                                                ui,
-                                                                "Price",
-                                                                &mut order.inline_sell_price,
-                                                                //60.0,
-                                                                30.0,
-                                                            );
-
-                                                            compact_input(
-                                                                ui,
-                                                                "Size",
-                                                                &mut order.inline_sell_size,
-                                                                //60.0,
-                                                                40.0,
-                                                            );
-
-                                                            /*
-                                                            ui.radio_value(
-                                                                &mut order.inline_sell_market_type,
-                                                                "FAK".to_string(),
-                                                                "FAK",
-                                                            );
-
-                                                            ui.radio_value(
-                                                                &mut order.inline_sell_market_type,
-                                                                "FOK".to_string(),
-                                                                "FOK",
-                                                            );
-                                                            */
-
-                                                            if themed_button(
-                                                                ui,
-                                                                "LIMIT EXIT",
-                                                                Theme::SELL_RED_BG,
-                                                                Theme::SELL_RED,
-                                                            )
-                                                            .clicked()
-                                                            {
-
-                                                                let _ =
-                                                                    self.cmd_tx.try_send(
-
-                                                                        UiCommand::PlaceLimit {
-
-                                                                            side: "sell".into(),
-
-                                                                            token:
-                                                                                order.token.clone(),
-
-                                                                            price:
-                                                                                order.inline_sell_price.clone(),
-
-                                                                            size:
-                                                                                order.inline_sell_size.clone(),
-
-                                                                            rapid_price:
-                                                                                "0".into(),
-
-                                                                            window_ts:
-                                                                                window.timestamp_5m,
-                                                                        }
-                                                                    );
-                                                            }
-
-                                                            if themed_button(
-                                                                ui,
-                                                                "MARKET EXIT",
-                                                                Theme::BLUE_BG,
-                                                                Theme::BLUE,
-                                                            )
-                                                            .clicked()
-                                                            {
-
-                                                                let _ =
-                                                                    self.cmd_tx.try_send(
-
-                                                                        UiCommand::PlaceMarket {
-
-                                                                            side: "sell".into(),
-
-                                                                            token:
-                                                                                order.token.clone(),
-
-                                                                            usdc: None,
-
-                                                                            shares:
-                                                                                Some(
-                                                                                    order.inline_sell_size.clone()
-                                                                                ),
-
-                                                                            /*
-                                                                            order_type:
-                                                                                Some(
-                                                                                    order.inline_sell_market_type.clone()
-                                                                                ),
-                                                                                */
-                                                                            order_type: 
-                                                                                Some("FAK".to_string()),
-                                                                                
-                                                                            window_ts:
-                                                                                window.timestamp_5m,
-                                                                        }
-                                                                    );
-                                                            }
-                                                        });
-                                                    });
-                                            }
-                                        });
-
-                                    ui.add_space(8.0);
-                                }
-                            });
+                            Self::render_order_column(
+
+                                &mut columns[2],
+
+                                "⚫ OTHERS",
+
+                                &others,
+
+                                window,
+
+                                &self.cmd_tx,
+                            );
+                        });
                     }
                 });
 
@@ -648,5 +375,379 @@ impl PolymarketDashboardApp {
 
             self.windows.remove(idx);
         }
+    }
+
+    fn render_order_column(
+        ui: &mut egui::Ui,
+        title: &str,
+        indices: &[usize],
+        window: &mut WindowGroup,
+        cmd_tx: &tokio::sync::mpsc::Sender<UiCommand>,
+    ) {
+
+        panel_frame()
+            .show(ui, |ui| {
+
+                ui.horizontal(|ui| {
+
+                    ui.heading(
+
+                        egui::RichText::new(title)
+                            .color(
+                                Theme::TEXT_PRIMARY
+                            )
+                    );
+
+                    ui.separator();
+
+                    ui.label(
+
+                        egui::RichText::new(
+                            indices.len().to_string()
+                        )
+                        .color(
+                            Theme::TEXT_MUTED
+                        )
+                    );
+                });
+
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical()
+
+                    .id_salt(format!(
+                        "{}_scroll_{}",
+                        title,
+                        window.timestamp_5m
+                    ))
+
+                    .max_height(550.0)
+
+                    .auto_shrink([false; 2])
+
+                    .show(ui, |ui| {
+
+                        for idx in indices {
+
+                            if let Some(order) =
+                                window.orders.get_mut(*idx)
+                            {
+
+                                Self::render_order_card(
+                                    ui,
+                                    order,
+                                    window.timestamp_5m,
+                                    cmd_tx,
+                                );
+
+                                ui.add_space(8.0);
+                            }
+                        }
+                    });
+            });
+    }
+
+    fn render_order_card(
+        ui: &mut egui::Ui,
+        order: &mut TrackedOrder,
+        window_ts: u64,
+        cmd_tx: &tokio::sync::mpsc::Sender<UiCommand>,
+    ) {
+
+        let (
+            fill,
+            border
+        ) = match &order.status {
+
+            LocalOrderStatus::Canceled => (
+
+                egui::Color32::from_rgba_unmultiplied(
+                    90,
+                    90,
+                    90,
+                    35,
+                ),
+
+                egui::Color32::from_rgb(
+                    120,
+                    120,
+                    120,
+                ),
+            ),
+
+            LocalOrderStatus::Failed(_) => (
+
+                Theme::SELL_RED_BG,
+
+                Theme::SELL_RED,
+            ),
+
+            _ => {
+
+                match (
+                    order.side.to_lowercase().as_str(),
+                    order.token.to_lowercase().as_str(),
+                ) {
+
+                    ("buy", "up") => (
+
+                        Theme::BUY_GREEN_BG,
+
+                        Theme::BUY_GREEN,
+                    ),
+
+                    ("buy", "down") => (
+
+                        Theme::SELL_RED_BG,
+
+                        Theme::SELL_RED,
+                    ),
+
+                    ("sell", _) => (
+
+                        Theme::BLUE_BG,
+
+                        Theme::BLUE,
+                    ),
+
+                    _ => (
+
+                        Theme::BG_ELEVATED,
+
+                        Theme::BORDER,
+                    ),
+                }
+            }
+        };
+
+        panel_frame()
+
+            .fill(fill)
+
+            .stroke(
+
+                egui::Stroke::new(
+                    1.0,
+                    border,
+                )
+            )
+
+            .show(ui, |ui| {
+
+                let display_price =
+                    order.executed_price
+                        .as_deref()
+                        .unwrap_or(&order.price);
+
+                let display_size =
+                    order.executed_size
+                        .as_deref()
+                        .unwrap_or(&order.size);
+
+                // =====================================================
+                // HEADER
+                // =====================================================
+
+                ui.horizontal_wrapped(|ui| {
+
+                    ui.label(
+
+                        egui::RichText::new(
+
+                            format!(
+                                "{} {} @ {} x {}",
+                                order.side.to_uppercase(),
+                                order.token.to_uppercase(),
+                                display_price,
+                                display_size,
+                            )
+                        )
+                        .monospace()
+                        .strong()
+                        .color(
+                            Theme::TEXT_PRIMARY
+                        )
+                    );
+
+                    ui.separator();
+
+                    ui.label(
+
+                        egui::RichText::new(
+
+                            format!(
+                                "MATCHED {}",
+                                order.size_matched
+                            )
+                        )
+                        .monospace()
+                        .color(
+                            Theme::TEXT_PRIMARY
+                        )
+                    );
+
+                    if matches!(
+                        order.status,
+                        LocalOrderStatus::Open
+                        | LocalOrderStatus::PartiallyFilled { .. }
+                    ) {
+
+                        if themed_button(
+                            ui,
+                            "CANCEL",
+                            Theme::SELL_RED_BG,
+                            Theme::SELL_RED,
+                        )
+                        .clicked()
+                        {
+
+                            let _ =
+                                cmd_tx.try_send(
+
+                                    UiCommand::CancelIndividual {
+
+                                        order_id:
+                                            order.id.clone(),
+
+                                        window_ts,
+                                    }
+                                );
+                        }
+                    }
+                });
+
+                // =====================================================
+                // STATUS
+                // =====================================================
+
+                ui.add_space(4.0);
+
+                ui.label(
+
+                    egui::RichText::new(
+                        format!("{:?}", order.status)
+                    )
+                    .monospace()
+                    .color(
+                        Theme::TEXT_MUTED
+                    )
+                );
+
+                // =====================================================
+                // INLINE EXIT DESK
+                // =====================================================
+
+                if matches!(
+                    order.status,
+                    LocalOrderStatus::FullyFilled
+                    | LocalOrderStatus::PartiallyFilled { .. }
+                )
+                && order.side.eq_ignore_ascii_case("buy")
+                {
+
+                    ui.add_space(8.0);
+
+                    panel_frame()
+
+                        .fill(
+                            Theme::BG_PANEL
+                        )
+
+                        .show(ui, |ui| {
+
+                            ui.vertical(|ui| {
+
+                                ui.horizontal_wrapped(|ui| {
+
+                                    compact_input(
+                                        ui,
+                                        "Price",
+                                        &mut order.inline_sell_price,
+                                        60.0,
+                                    );
+
+                                    compact_input(
+                                        ui,
+                                        "Size",
+                                        &mut order.inline_sell_size,
+                                        60.0,
+                                    );
+                                });
+
+                                ui.add_space(6.0);
+
+                                ui.horizontal_wrapped(|ui| {
+
+                                    if themed_button(
+                                        ui,
+                                        "LIMIT EXIT",
+                                        Theme::SELL_RED_BG,
+                                        Theme::SELL_RED,
+                                    )
+                                    .clicked()
+                                    {
+
+                                        let _ =
+                                            cmd_tx.try_send(
+
+                                                UiCommand::PlaceLimit {
+
+                                                    side: "sell".into(),
+
+                                                    token:
+                                                        order.token.clone(),
+
+                                                    price:
+                                                        order.inline_sell_price.clone(),
+
+                                                    size:
+                                                        order.inline_sell_size.clone(),
+
+                                                    rapid_price:
+                                                        "0".into(),
+
+                                                    window_ts,
+                                                }
+                                            );
+                                    }
+
+                                    if themed_button(
+                                        ui,
+                                        "MARKET EXIT",
+                                        Theme::BLUE_BG,
+                                        Theme::BLUE,
+                                    )
+                                    .clicked()
+                                    {
+
+                                        let _ =
+                                            cmd_tx.try_send(
+
+                                                UiCommand::PlaceMarket {
+
+                                                    side: "sell".into(),
+
+                                                    token:
+                                                        order.token.clone(),
+
+                                                    usdc: None,
+
+                                                    shares:
+                                                        Some(
+                                                            order.inline_sell_size.clone()
+                                                        ),
+
+                                                    order_type:
+                                                        Some("FAK".to_string()),
+
+                                                    window_ts,
+                                                }
+                                            );
+                                    }
+                                });
+                            });
+                        });
+                }
+            });
     }
 }
