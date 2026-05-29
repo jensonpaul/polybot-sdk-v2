@@ -109,45 +109,36 @@ impl PolymarketDashboardApp {
 
                             |ui| {
 
-                                //let desired_width = 120.0;
-                                let desired_width = ui.available_width().clamp(120.0, 200.0);
+                                if themed_button(
+                                    ui,
+                                    "CLOSE",
+                                    Theme::SELL_RED_BG,
+                                    Theme::SELL_RED,
+                                )
+                                .clicked()
+                                {
+                                    windows_to_remove
+                                        .push(w_idx);
+                                }
 
-                                ui.allocate_ui(egui::vec2(desired_width, 0.0), |ui| {
+                                if themed_button(
+                                    ui,
+                                    "CANCEL ALL",
+                                    Theme::SELL_RED_BG,
+                                    Theme::SELL_RED,
+                                )
+                                .clicked()
+                                {
+                                    let _ =
+                                        self.cmd_tx.try_send(
 
-                                    ui.horizontal(|ui| {
+                                            UiCommand::CancelAllInWindow {
 
-                                        if themed_button(
-                                            ui,
-                                            "CLOSE",
-                                            Theme::SELL_RED_BG,
-                                            Theme::SELL_RED,
-                                        )
-                                        .clicked()
-                                        {
-                                            windows_to_remove
-                                                .push(w_idx);
-                                        }
-
-                                        if themed_button(
-                                            ui,
-                                            "CANCEL ALL",
-                                            Theme::SELL_RED_BG,
-                                            Theme::SELL_RED,
-                                        )
-                                        .clicked()
-                                        {
-                                            let _ =
-                                                self.cmd_tx.try_send(
-
-                                                    UiCommand::CancelAllInWindow {
-
-                                                        window_ts:
-                                                            window.timestamp_5m,
-                                                    }
-                                                );
-                                        }
-                                    });
-                                });
+                                                window_ts:
+                                                    window.timestamp_5m,
+                                            }
+                                        );
+                                }
                             }
                         );
                     });
@@ -385,8 +376,8 @@ impl PolymarketDashboardApp {
 
                                             let display_size =
                                                 match order.status {
-                                                    LocalOrderStatus::FullyFilled
-                                                    | LocalOrderStatus::PartiallyFilled { .. } => {
+                                                    OrderStatus::FullyFilled
+                                                    | OrderStatus::PartiallyFilled => {
                                                         order.executed_size.as_deref().unwrap_or(&order.size)
                                                     }
 
@@ -444,43 +435,67 @@ impl PolymarketDashboardApp {
                                                     )
                                                 );
 
-                                                ui.add_space(8.0);
+                                                ui.with_layout(
 
-                                                if matches!(
-                                                    order.status,
-                                                    LocalOrderStatus::Open 
-                                                    | LocalOrderStatus::PartiallyFilled { .. }
-                                                ) {
-                                                    if themed_button(
-                                                        ui,
-                                                        "CANCEL",
-                                                        Theme::SELL_RED_BG,
-                                                        Theme::SELL_RED,
-                                                    )
-                                                    .clicked()
-                                                    {
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center
+                                                    ),
 
-                                                        let _ =
-                                                            self.cmd_tx.try_send(
+                                                    |ui| {
 
-                                                                UiCommand::CancelIndividual {
+                                                        if themed_button(
+                                                            ui,
+                                                            "CANCEL",
+                                                            Theme::SELL_RED_BG,
+                                                            Theme::SELL_RED,
+                                                        )
+                                                        .clicked()
+                                                        {
 
-                                                                    order_id:
-                                                                        order.id.clone(),
+                                                            let _ =
+                                                                self.cmd_tx.try_send(
 
-                                                                    window_ts:
-                                                                        window.timestamp_5m,
-                                                                }
-                                                            );
+                                                                    UiCommand::CancelIndividual {
+
+                                                                        order_id:
+                                                                            order.id.clone(),
+
+                                                                        window_ts:
+                                                                            window.timestamp_5m,
+                                                                    }
+                                                                );
+                                                        }
+
+                                                        if themed_button(
+                                                            ui,
+                                                            "SYNC",
+                                                            Theme::BLUE_BG,
+                                                            Theme::BLUE,
+                                                        )
+                                                        .clicked()
+                                                        {
+
+                                                            let _ =
+                                                                self.cmd_tx.try_send(
+
+                                                                    UiCommand::CheckStatus {
+
+                                                                        order_id:
+                                                                            order.id.clone(),
+
+                                                                        window_ts:
+                                                                            window.timestamp_5m,
+                                                                    }
+                                                                );
+                                                        }
                                                     }
-                                                }
+                                                );
                                             });
 
                                             // =====================================================
                                             // INLINE EXIT DESK
                                             // =====================================================
 
-                                            /*
                                             if order.side.eq_ignore_ascii_case("buy")
                                                 && order
                                                     .size_matched
@@ -488,12 +503,6 @@ impl PolymarketDashboardApp {
                                                     .parse::<f64>()
                                                     .map(|n| n > 0.0)
                                                     .unwrap_or(false)
-                                                    */
-                                            if matches!(
-                                                order.status,
-                                                LocalOrderStatus::FullyFilled 
-                                                | LocalOrderStatus::PartiallyFilled { .. }
-                                            ) && order.side.eq_ignore_ascii_case("buy")                                            
                                             {
 
                                                 ui.add_space(8.0);
