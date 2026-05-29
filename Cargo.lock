@@ -4447,11 +4447,12 @@ dependencies = [
 
 [[package]]
 name = "polybot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy",
  "anyhow",
  "arc-swap",
+ "dashmap",
  "dotenv",
  "eframe",
  "egui",
@@ -6207,7 +6208,9 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

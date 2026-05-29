@@ -1,12 +1,12 @@
 [package]
 name = "polybot"
 description = "Polymarket Trading Terminal"
-version = "0.1.0"
+version = "0.2.0"
 authors = [
     "Jenson Paul <jensonpaul@cdk.cd>",
 ]
 readme = "README.md"
-repository = "https://github.com/jensonpaul/polybot-rs-clob-client-v2"
+repository = "https://github.com/jensonpaul/polybot-sdk-v2"
 license = "MIT"
 keywords = ["polymarket", "clob", "orderbook", "trading", "prediction-market"]
 categories = [
@@ -37,20 +37,21 @@ polymarket_client_sdk_v2 = {
 		"clob"
 	] 
 }
-anyhow = "1.0.102"
-arc-swap = "1.9.1"
-dotenv = "0.15.0"
-eframe = "0.33.3"
-egui = "0.33.3"
-lazy_static = "1.5.0"
+anyhow        = "1.0.102"
+arc-swap      = "1.9.1"
+dashmap       = "6.1.0"
+dotenv        = "0.15.0"
+eframe        = "0.33.3"
+egui          = "0.33.3"
+lazy_static   = "1.5.0"
 tracing-subscriber = { version = "0.3", features = ["chrono", "env-filter"] }
-tokio = "1.50.0"
-tracing = "0.1"
-rust_decimal = { version = "1.41.0", features = ["serde"] }
+tokio         = { version = "1.50.0", features = ["full"] }
+tracing       = "0.1"
+rust_decimal  = { version = "1.41.0", features = ["serde"] }
 rust_decimal_macros = "1.40.0"
-futures = "0.3.32"
-futures-util = "0.3.31"
-serde = "1.0.228"
+futures       = "0.3.32"
+futures-util  = "0.3.31"
+serde         = "1.0.228"
 alloy = { version = "1.6.3", default-features = false, features = [
     "dyn-abi",
     "reqwest",

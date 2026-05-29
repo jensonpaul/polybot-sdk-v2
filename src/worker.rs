@@ -1,81 +1,116 @@
-use crate::ui_types::{
-    RapidSellState, LocalOrderStatus, NotificationKind, OrderLimitRequest, OrderMarketRequest, TrackedOrder, UiCommand, WorkerUpdate,
-};
-use eframe::egui;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use std::time::Duration;
-use tokio::sync::mpsc::{Receiver, Sender};
-use std::sync::atomic::{AtomicU64, Ordering};
+//! # Background Worker
+//!
+//! The worker is a pure command executor + polling engine.  It is the **sole
+//! writer** of [`crate::state::AppState`] (orders, trades, rapid-sell state).
+//!
+//! Architecture:
+//!
+//! ```text
+//!   ┌──────────────────────────────────────────────────┐
+//!   │  PolymarketWorker::run()                         │
+//!   │                                                  │
+//!   │  ┌─ Task A: orders polling loop  ───────────┐   │
+//!   │  │  (polls open orders, updates AppState)   │   │
+//!   │  └──────────────────────────────────────────┘   │
+//!   │                                                  │
+//!   │  ┌─ Task B: trades polling loop  ───────────┐   │
+//!   │  │  (syncs trade confirmations)             │   │
+//!   │  └──────────────────────────────────────────┘   │
+//!   │                                                  │
+//!   │  ┌─ Task C: rapid-sell automation  ─────────┐   │
+//!   │  │  (auto-posts sell on confirmed buys)     │   │
+//!   │  └──────────────────────────────────────────┘   │
+//!   │                                                  │
+//!   │  ┌─ Main loop: UiCommand dispatcher  ───────┐   │
+//!   │  │  (PlaceLimit, PlaceMarket, Cancel, …)    │   │
+//!   │  └──────────────────────────────────────────┘   │
+//!   └──────────────────────────────────────────────────┘
+//! ```
+//!
+//! After every write the worker calls `state.touch()` and
+//! `ctx.request_repaint()` so the UI wakes up exactly when there is new data.
 
-use rust_decimal_macros::dec;
-
-use crate::worker_config::{SharedPollConfig, Queue};
-
-// START
-// SDK dependencies
 use std::collections::HashMap;
-use std::str::FromStr as _;
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::signers::Signer as _;
 use alloy::signers::local::LocalSigner;
-
 use lazy_static::lazy_static;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
+use rust_decimal_macros::dec;
+use serde::Deserialize;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::Ordering;
+use tracing::{info, instrument, warn};
 
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::{Credentials, Normal};
 use polymarket_client_sdk_v2::clob::{Client as ClobClient, Config};
-use polymarket_client_sdk_v2::clob::types::{Side, SignatureType, OrderType, OrderStatusType, TradeStatusType, Amount, TickSize};
-use polymarket_client_sdk_v2::clob::types::request::{TradesRequest};
-use polymarket_client_sdk_v2::clob::types::response::{PostOrderResponse, OpenOrderResponse, CancelOrdersResponse, TradeResponse};
+use polymarket_client_sdk_v2::clob::types::{
+    Amount, OrderType, OrderStatusType, Side, SignatureType, TickSize, TradeStatusType,
+};
+use polymarket_client_sdk_v2::clob::types::request::TradesRequest;
+use polymarket_client_sdk_v2::clob::types::response::{
+    CancelOrdersResponse, OpenOrderResponse, PostOrderResponse, TradeResponse,
+};
 use polymarket_client_sdk_v2::gamma::Client as GammaClient;
 use polymarket_client_sdk_v2::gamma::types::request::MarketBySlugRequest;
 use polymarket_client_sdk_v2::gamma::types::response::Market;
-use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
-
-use serde::Deserialize;
-use tracing::{info, instrument};
-
+use polymarket_client_sdk_v2::types::{Address, U256};
 pub use polymarket_client_sdk_v2::error::Error;
 
-use arc_swap::ArcSwap;
-use crate::market_data::{MarketFeedHandle, MarketPrices, SharedMarketPrices, spawn_market_feed};
+use crate::market_data::start_market_feed;
+use crate::messages::{UiCommand, WorkerEvent};
+use crate::state::{
+    AppState, LocalOrderStatus, NotificationKind, RapidSellState, SharedAppState, TrackedOrder,
+    slug_for_ts, stamp_5m,
+};
+use crate::worker_config::{Queue, SharedPollConfig};
+
+// ---------------------------------------------------------------------------
+// Module-level caches
+// ---------------------------------------------------------------------------
 
 lazy_static! {
-    static ref MARKET_BY_SLUG_CACHE:
-        std::sync::Mutex<HashMap<String, Market>>
-        = std::sync::Mutex::new(HashMap::new());
+    static ref MARKET_CACHE: std::sync::Mutex<HashMap<String, Market>> =
+        std::sync::Mutex::new(HashMap::new());
 
-    static ref API_CREDS_CACHE:
-        std::sync::Mutex<HashMap<String, Credentials>>
-        = std::sync::Mutex::new(HashMap::new());
+    static ref CREDS_CACHE: std::sync::Mutex<HashMap<String, Credentials>> =
+        std::sync::Mutex::new(HashMap::new());
 }
-// END
+
+// ---------------------------------------------------------------------------
+// Worker
+// ---------------------------------------------------------------------------
+
+type AuthenticatedClient = ClobClient<Authenticated<Normal>>;
+type SharedClient = Arc<Mutex<Option<AuthenticatedClient>>>;
 
 pub struct PolymarketWorker {
     pub cmd_rx: Receiver<UiCommand>,
-    pub update_tx: Sender<WorkerUpdate>,
+    pub event_tx: Sender<WorkerEvent>,
     pub ctx: egui::Context,
-    pub clob_client: Arc<Mutex<Option<ClobClient<Authenticated<Normal>>>>>, // persistent client
+    pub state: SharedAppState,
     pub poll_config: SharedPollConfig,
-    pub market_tasks:
-        Arc<
-            tokio::sync::Mutex<
-                HashMap<u64, MarketFeedHandle>
-            >
-        >,
 }
 
 impl PolymarketWorker {
-    pub async fn init_clob_client(&self) -> anyhow::Result<ClobClient<Authenticated<Normal>>> {
+    async fn init_client(&self) -> anyhow::Result<AuthenticatedClient> {
         let private_key = std::env::var("PRIVATE_KEY_VAR")?;
-        let host = std::env::var("CLOB_API_URL").unwrap_or_else(|_| "https://clob.polymarket.com".into());
+        let host = std::env::var("CLOB_API_URL")
+            .unwrap_or_else(|_| "https://clob.polymarket.com".into());
         let deposit_wallet = Address::from_str(&std::env::var("DEPOSIT_WALLET")?)?;
-        
-        let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
-        let creds = get_or_fetch_api_creds(private_key.clone(), host.clone()).await?;
-        
+
+        let signer = LocalSigner::from_str(&private_key)?
+            .with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
+
+        let creds =
+            get_or_fetch_api_creds(private_key.clone(), host.clone()).await?;
+
         let client = ClobClient::new(&host, Config::default())?
             .authentication_builder(&signer)
             .funder(deposit_wallet)
@@ -87,1106 +122,131 @@ impl PolymarketWorker {
         Ok(client)
     }
 
-    /*
-    /// Spawns a Tokio task with a locked `clob_client` instance.
-    pub fn spawn_with_client<F, Fut>(&self, f: F)
-    where
-        F: FnOnce(Client<polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
-    {
-        let clob_client = self.clob_client.clone();
-
-        tokio::spawn(async move {
-            //let mut client_guard = clob_client.lock().await;
-            //let client = client_guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialized"))?;
-            let client_guard = clob_client.lock().await;
-            let client = match &*client_guard {
-                Some(c) => c.clone(),
-                None => {
-                    tracing::error!("ClobClient not initialized");
-                    return;
-                }
-            };
-
-            f(client).await;
-        });
-    }
-    */
-
     pub async fn run(mut self) -> anyhow::Result<()> {
-        tracing::info!("PolymarketWorker: running execution loop");
+        info!("PolymarketWorker: starting");
 
-        let orders_polling_interval_ms =
-            self.poll_config.get_atomic(Queue::Orders);
+        let client: SharedClient = {
+            let c = self.init_client().await?;
+            Arc::new(Mutex::new(Some(c)))
+        };
 
-        let trades_polling_interval_ms =
-            self.poll_config.get_atomic(Queue::Trades);
+        // ------------------------------------------------------------------
+        // Shared helpers passed into spawned tasks
+        // ------------------------------------------------------------------
+        let state = self.state.clone();
+        let ctx = self.ctx.clone();
 
-        let rapid_sell_polling_interval_ms =
-            self.poll_config.get_atomic(Queue::RapidSell);
+        // `orders_to_poll`: the set of (window_ts, order_id) pairs currently
+        // being watched by the polling loop.
+        let orders_to_poll: Arc<Mutex<Vec<(u64, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
 
-        let orders_to_poll = Arc::new(Mutex::new(Vec::<(u64, String)>::new()));
-        let tracked_orders = Arc::new(Mutex::new(HashMap::<String, TrackedOrder>::new()));
-        let tracked_trades = Arc::new(
-            Mutex::new(HashMap::<String, TradeResponse>::new())
+        // ------------------------------------------------------------------
+        // Task A: Orders polling loop
+        // ------------------------------------------------------------------
+        spawn_orders_polling_loop(
+            Arc::clone(&client),
+            Arc::clone(&orders_to_poll),
+            Arc::clone(&state),
+            ctx.clone(),
+            self.poll_config.atomic(Queue::Orders),
+            self.event_tx.clone(),
         );
 
-        // Initialize the client
-        let client = self.init_clob_client().await?;
-        let clob_client = Arc::new(tokio::sync::Mutex::new(Some(client)));
-
-        // -------------------------------------------------------------
-        // TASK 1: Isolated Heartbeat Orders Polling Loop
-        // -------------------------------------------------------------
-        let poll_orders = Arc::clone(&orders_to_poll);
-        let tracked_orders_for_polling = tracked_orders.clone();
-        let tracked_trades_for_polling_clone = tracked_trades.clone();
-        let poll_tx = self.update_tx.clone();
-        let poll_ctx = self.ctx.clone();
-
-        let clob_client_for_tracking = clob_client.clone(); // clone the Arc for this task
-
-        // Clone for orders polling task
-        let orders_interval_clone =
-            orders_polling_interval_ms.clone();
-
-        tokio::spawn(async move {
-            let mut current_interval =
-                orders_interval_clone.load(Ordering::Relaxed);
-
-            let mut interval = tokio::time::interval(
-                Duration::from_millis(
-                    current_interval.max(1) // prevent panic
-                ),
-            );
-
-            loop {
-                let latest_interval =
-                    orders_interval_clone.load(Ordering::Relaxed);
-
-                // Detect interval changes
-                if latest_interval != current_interval {
-                    current_interval = latest_interval;
-
-                    // Only rebuild timer if enabled
-                    if current_interval > 0 {
-                        interval = tokio::time::interval(
-                            Duration::from_millis(current_interval),
-                        );
-
-                        tracing::info!(
-                            "Orders Polling interval updated to {} ms",
-                            current_interval
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Orders polling disabled"
-                        );
-                    }
-                }
-
-                // ------------------------------------
-                // ORDERS POLLING DISABLED
-                // ------------------------------------
-                if current_interval == 0 {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-
-                interval.tick().await;
-
-                let active_tracked_orders: Vec<(u64, String)> = {
-                    let lock = poll_orders.lock().await;
-                    lock.clone()
-                };
-
-                if active_tracked_orders.is_empty() {
-                    continue;
-                }
-
-                let mut active_removals = Vec::new();
-
-                for (window_ts, order_id) in active_tracked_orders {
-                    // Assuming get_order_status now returns anyhow::Result<OpenOrderResponse>
-                    if let Ok(order_info) = get_order_status(clob_client_for_tracking.clone(), &order_id).await {
-                        
-                        // 1. Calculate matching execution milestones
-                        //let is_fully_filled = order_info.size_matched >= order_info.original_size;
-                        let tolerance_pct = dec!(0.005); // 0.5%
-                        let is_fully_filled =
-                            order_info.size_matched >= order_info.original_size * (dec!(1.0) - tolerance_pct);
-                        let matched_string = format!("{}/{}", order_info.size_matched, order_info.original_size);
-
-                        let mut is_trade_fully_confirmed = false;
-
-                        {
-                            let trades_lock = tracked_trades_for_polling_clone.lock().await;
-
-                            if !order_info.associate_trades.is_empty() {
-
-                                let confirmed_size: Decimal =
-                                    order_info
-                                        .associate_trades
-                                        .iter()
-                                        .filter_map(|trade_id| {
-                                            trades_lock.get(trade_id)
-                                        })
-                                        .filter(|trade| {
-                                            matches!(
-                                                trade.status,
-                                                TradeStatusType::Confirmed
-                                            )
-                                        })
-                                        .map(|trade| trade.size)
-                                        .sum();
-
-                                let tolerance_pct = dec!(0.005);
-
-                                is_trade_fully_confirmed =
-                                    confirmed_size >=
-                                    order_info.original_size
-                                        * (dec!(1.0) - tolerance_pct);
-                            }
-                        }
-
-                        // 2. Map target internal statuses based on our new OrderStatusType enum variations
-                        let target_status = match order_info.status {
-                            OrderStatusType::Live => {
-                                if order_info.size_matched > rust_decimal::Decimal::ZERO {
-                                    LocalOrderStatus::PartiallyFilled {
-                                        filled: order_info.size_matched.to_string(),
-                                    }
-                                } else {
-                                    LocalOrderStatus::Open
-                                }
-                            }
-                            OrderStatusType::Matched => {
-
-                                // fully matched by engine
-                                if is_fully_filled {
-
-                                    // trades finalized
-                                    if is_trade_fully_confirmed {
-
-                                        active_removals.push(order_id.clone());
-
-                                        LocalOrderStatus::TradeConfirmed
-                                    } else {
-
-                                        //LocalOrderStatus::TradeOpen
-                                        LocalOrderStatus::FullyFilled
-                                    }
-
-                                } else {
-
-                                    LocalOrderStatus::PartiallyFilled {
-                                        filled: order_info.size_matched.to_string(),
-                                    }
-                                }
-                            }
-                            OrderStatusType::Canceled => {
-                                // If dead, stop tracking this order completely on future iterations
-                                active_removals.push(order_id.clone());
-                                LocalOrderStatus::Canceled
-                            }
-                            OrderStatusType::Unknown(ref reason) => {
-                                if reason == "INVALID" {
-                                    // If dead, stop tracking this order completely on future iterations
-                                    active_removals.push(order_id.clone());
-                                    LocalOrderStatus::Canceled
-                                } else {
-                                    tracing::warn!(
-                                        "Encountered unknown order status '{}' for order {}",
-                                        reason,
-                                        order_id
-                                    );
-                                    LocalOrderStatus::Canceled
-                                }
-                            }
-                            _ => {
-                                tracing::warn!("Encountered unknown non-exhaustive status type for order {}", order_id);
-                                LocalOrderStatus::Canceled
-                            }
-                        };
-
-                        // 3. Dispatch structured status packet down to your central state framework
-                        let _ = poll_tx
-                            .send(WorkerUpdate::OrderUpdated {
-                                window_ts,
-                                order_id: order_id.clone(),
-                                status: target_status.clone(),
-                                matched: order_info.size_matched.to_string(),
-                                open_order_response: Some(order_info.clone()),
-                            })
-                            .await;
-
-                        // 4. Also update the Worker State
-                        if let Some(o) = tracked_orders_for_polling
-                            .lock()
-                            .await
-                            .get_mut(&order_id)
-                        {
-                            // keep worker state in sync with API truth
-                            o.status = target_status;
-                            o.size_matched = order_info
-                                .size_matched
-                                .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero)
-                                .to_string();
-                            
-                            // -------------------------------------------------
-                            // UPDATE EXECUTION PRICE + SIZE
-                            // -------------------------------------------------
-
-                            // actual filled size
-                            o.executed_size = Some(
-                                order_info
-                                    .size_matched
-                                    .round_dp_with_strategy(
-                                        2,
-                                        rust_decimal::RoundingStrategy::ToZero
-                                    )
-                                    .to_string()
-                                );
-
-                            // execution price
-                            //
-                            // Polymarket average fill price:
-                            // amount matched / shares matched
-                            //
-                            if order_info.size_matched > Decimal::ZERO {
-
-                                o.executed_price = Some(
-                                    order_info
-                                        .price
-                                        .round_dp_with_strategy(
-                                            4,
-                                            rust_decimal::RoundingStrategy::ToZero
-                                        )
-                                        .to_string()
-                                    );
-                            }
-
-                            o.is_trade_fully_confirmed =
-                                is_trade_fully_confirmed;
-
-                            o.associate_trades =
-                                order_info.associate_trades.clone();
-
-                            o.open_order_response =
-                                Some(order_info.clone());
-                        }
-                    }
-                }
-
-                // Remove fully filled/canceled orders from polling
-                if !active_removals.is_empty() {
-                    let mut lock = poll_orders.lock().await;
-                    lock.retain(|(_, id)| !active_removals.contains(id));
-                }
-
-                poll_ctx.request_repaint();
-            }
-        });
-
-        // -------------------------------------------------------------
-        // TASK 1B: TRADE TRACKING LOOP
-        // -------------------------------------------------------------
-        let tracked_trades_for_polling =
-            tracked_trades.clone();
-
-        let tracked_orders_for_trades =
-            tracked_orders.clone();
-
-        let trades_interval_clone =
-            trades_polling_interval_ms.clone();
-
-        let clob_client_for_trades =
-            clob_client.clone();
-
-        tokio::spawn(async move {
-
-            let mut current_interval =
-                trades_interval_clone.load(Ordering::Relaxed);
-
-            let mut interval = tokio::time::interval(
-                Duration::from_millis(
-                    current_interval.max(1)
-                )
-            );
-
-            loop {
-
-                // -------------------------------------------------
-                // HANDLE INTERVAL CHANGES
-                // -------------------------------------------------
-                let latest_interval =
-                    trades_interval_clone.load(
-                        Ordering::Relaxed
-                    );
-
-                if latest_interval != current_interval {
-
-                    current_interval =
-                        latest_interval;
-
-                    interval = tokio::time::interval(
-                        Duration::from_millis(
-                            current_interval.max(1)
-                        )
-                    );
-
-                    tracing::info!(
-                        "Trades polling interval updated to {} ms",
-                        current_interval
-                    );
-                }
-
-                // -------------------------------------------------
-                // POLLING DISABLED
-                // -------------------------------------------------
-                if current_interval == 0 {
-                    tokio::time::sleep(
-                        Duration::from_millis(250)
-                    )
-                    .await;
-
-                    continue;
-                }
-
-                interval.tick().await;
-
-                // -------------------------------------------------
-                // SNAPSHOT TRACKED ORDERS
-                // -------------------------------------------------
-                let tracked_snapshot = {
-                    tracked_orders_for_trades
-                        .lock()
-                        .await
-                        .clone()
-                };
-
-                if tracked_snapshot.is_empty() {
-                    continue;
-                }
-
-                // -------------------------------------------------
-                // FETCH TRADES FOR EACH MARKET
-                // -------------------------------------------------
-                for (_, tracked_order) in tracked_snapshot {
-
-                    let current_anchor = initiate_stamp_5m();
-                    let slug = build_slug_for_timestamp(
-                        //tracked_order.window_ts
-                        current_anchor
-                    );
-
-                    // ---------------------------------------------
-                    // FETCH MARKET CONDITION ID
-                    // ---------------------------------------------
-                    let condition_id = {
-                        let cache = MARKET_BY_SLUG_CACHE.lock().unwrap();
-
-                        cache
-                            .get(&slug)
-                            .and_then(|market| market.condition_id)
-                    };
-
-                    let Some(condition_id) = condition_id else {
-                        continue;
-                    };
-
-                    // ---------------------------------------------
-                    // BUILD REQUEST
-                    // ---------------------------------------------
-                    let mut request =
-                        TradesRequest::builder()
-                            .build();
-
-                    request.market =
-                        Some(condition_id);
-
-                    // ---------------------------------------------
-                    // FETCH TRADES
-                    // ---------------------------------------------
-                    let trades_page_result = {
-
-                        let client_guard =
-                            clob_client_for_trades
-                                .lock()
-                                .await;
-
-                        let Some(client) =
-                            client_guard.as_ref()
-                        else {
-                            tracing::warn!(
-                                "Trades polling skipped: client unavailable"
-                            );
-
-                            continue;
-                        };
-
-                        client
-                            .trades(&request, None)
-                            .await
-                    };
-
-                    // ---------------------------------------------
-                    // PROCESS RESPONSE
-                    // ---------------------------------------------
-                    match trades_page_result {
-
-                        Ok(page) => {
-
-                            let mut trades_lock =
-                                tracked_trades_for_polling
-                                    .lock()
-                                    .await;
-
-                            for trade in page.data {
-
-                                tracing::debug!(
-                                    "Tracked trade updated: {} ({:?})",
-                                    trade.id,
-                                    trade.status
-                                );
-
-                                trades_lock.insert(
-                                    trade.id.clone(),
-                                    trade,
-                                );
-                            }
-                        }
-
-                        Err(err) => {
-
-                            tracing::error!(
-                                "Trade polling failed for slug {}: {:?}",
-                                slug,
-                                err
-                            );
-                        }
-                    }
-                }
-            }
-        });
-
-
-        // -------------------------------------------------------------
-        // TASK 1C: RAPID SELL LOOP
-        // -------------------------------------------------------------
-        let tracked_orders_for_rapid =
-            tracked_orders.clone();
-
-        let rapid_interval_clone =
-            rapid_sell_polling_interval_ms.clone();
-
-        let clob_client_for_rapid =
-            clob_client.clone();
-
-        let rapid_tx =
-            self.update_tx.clone();
-
-        let rapid_poll_orders =
-            orders_to_poll.clone();
-        
-        tokio::spawn(async move {
-
-            let mut current_interval =
-                rapid_interval_clone.load(
-                    Ordering::Relaxed
-                );
-
-            let mut interval = tokio::time::interval(
-                Duration::from_millis(
-                    current_interval.max(1)
-                )
-            );
-
-            loop {
-
-                // -------------------------------------------------
-                // HANDLE INTERVAL CHANGES
-                // -------------------------------------------------
-                let latest_interval =
-                    rapid_interval_clone.load(
-                        Ordering::Relaxed
-                    );
-
-                if latest_interval != current_interval {
-
-                    current_interval =
-                        latest_interval;
-
-                    interval = tokio::time::interval(
-                        Duration::from_millis(
-                            current_interval.max(1)
-                        )
-                    );
-
-                    tracing::info!(
-                        "Rapid sell interval updated to {} ms",
-                        current_interval
-                    );
-                }
-
-                // -------------------------------------------------
-                // POLLING DISABLED
-                // -------------------------------------------------
-                if current_interval == 0 {
-
-                    tokio::time::sleep(
-                        Duration::from_millis(250)
-                    )
-                    .await;
-
-                    continue;
-                }
-
-                interval.tick().await;
-
-                // -------------------------------------------------
-                // SNAPSHOT TRACKED ORDERS
-                // -------------------------------------------------
-                let snapshot = {
-                    tracked_orders_for_rapid
-                        .lock()
-                        .await
-                        .clone()
-                };
-
-                // -------------------------------------------------
-                // PROCESS RAPID SELLS
-                // -------------------------------------------------
-                for (_, snapshot_order) in snapshot {
-
-                    // ---------------------------------------------
-                    // BUY ORDERS ONLY
-                    // ---------------------------------------------
-                    if snapshot_order.side.to_lowercase()
-                        != "buy"
-                    {
-                        continue;
-                    }
-
-                    // ---------------------------------------------
-                    // REQUIRE TRADE CONFIRMATION
-                    // ---------------------------------------------
-                    if !matches!(
-                        snapshot_order.status,
-                        LocalOrderStatus::TradeConfirmed
-                    ) {
-                        continue;
-                    }
-
-                    if !snapshot_order
-                        .is_trade_fully_confirmed
-                    {
-                        continue;
-                    }
-
-                    // ---------------------------------------------
-                    // PREVENT DUPLICATE ATTEMPTS
-                    // ---------------------------------------------
-                    if !matches!(
-                        snapshot_order.rapid_sell_state,
-                        RapidSellState::Idle
-                            | RapidSellState::Failed(_)
-                    ) {
-                        continue;
-                    }
-
-                    // ---------------------------------------------
-                    // PARSE VALUES
-                    // ---------------------------------------------
-                    let matched =
-                        Decimal::from_str(
-                            &snapshot_order.size_matched
-                        )
-                        .unwrap_or_default();
-
-                    let already_sold =
-                        Decimal::from_str(
-                            &snapshot_order.rapid_sell_size
-                        )
-                        .unwrap_or_default();
-
-                    let sell_price =
-                        Decimal::from_str(
-                            &snapshot_order.rapid_sell_price
-                        )
-                        .unwrap_or_default();
-
-                    let min_sell_size =
-                        Decimal::from(5);
-
-                    // ---------------------------------------------
-                    // VALIDATE CONFIG
-                    // ---------------------------------------------
-                    if sell_price <= Decimal::ZERO {
-                        continue;
-                    }
-
-                    let sell_amount =
-                        (matched - already_sold)
-                            .max(Decimal::ZERO);
-
-                    if sell_amount < min_sell_size {
-                        continue;
-                    }
-
-                    // ---------------------------------------------
-                    // MARK PENDING IMMEDIATELY
-                    // ---------------------------------------------
-                    {
-                        let mut tracked =
-                            tracked_orders_for_rapid
-                                .lock()
-                                .await;
-
-                        if let Some(order) =
-                            tracked.get_mut(
-                                &snapshot_order.id
-                            )
-                        {
-                            order.rapid_sell_state =
-                                RapidSellState::Pending;
-                        }
-                    }
-
-                    tracing::info!(
-                        "Attempting Rapid Sell: {:?}",
-                        snapshot_order
-                    );
-
-                    // ---------------------------------------------
-                    // BUILD SELL REQUEST
-                    // ---------------------------------------------
-                    let sell_req =
-                        OrderLimitRequest {
-                            side: "sell".into(),
-
-                            token:
-                                snapshot_order.token.clone(),
-
-                            price:
-                                snapshot_order
-                                    .rapid_sell_price
-                                    .clone(),
-
-                            size:
-                                sell_amount.to_string(),
-                        };
-
-                    let clob_client_clone =
-                        clob_client_for_rapid.clone();
-
-                    let update_tx_clone =
-                        rapid_tx.clone();
-
-                    let tracked_orders_clone =
-                        tracked_orders_for_rapid.clone();
-
-                    let rapid_poll_orders_clone =
-                        rapid_poll_orders.clone();
-
-                    let window_ts_clone =
-                        snapshot_order.window_ts;
-
-                    let parent_order_id =
-                        snapshot_order.id.clone();
-
-                    let token_clone =
-                        snapshot_order.token.clone();
-
-                    let rapid_sell_price_clone =
-                        snapshot_order
-                            .rapid_sell_price
-                            .clone();
-
-                    tokio::spawn(async move {
-
-                        let current_anchor = initiate_stamp_5m();
-                        match place_order_limit(
-                            clob_client_clone,
-                            &sell_req,
-                            &build_slug_for_timestamp(
-                                //window_ts_clone
-                                current_anchor
-                            ),
-                        )
-                        .await
-                        {
-
-                            // -------------------------------------
-                            // SUCCESS
-                            // -------------------------------------
-                            Ok(resp) => {
-
-                                tracing::info!(
-                                    "Rapid Sell Response: {:?}",
-                                    resp
-                                );
-
-                                match parse_order_api_response(resp)
-                                {
-
-                                    Ok(new_order_id) => {
-
-                                        // -------------------------
-                                        // TRACK NEW SELL ORDER
-                                        // -------------------------
-                                        {
-                                            let mut lock =
-                                                rapid_poll_orders_clone
-                                                    .lock()
-                                                    .await;
-
-                                            lock.push((
-                                                window_ts_clone,
-                                                new_order_id.clone(),
-                                            ));
-                                        }
-
-                                        // -------------------------
-                                        // CREATE TRACKED ORDER
-                                        // -------------------------
-                                        let new_tracked_order =
-                                            TrackedOrder {
-                                                id:
-                                                    new_order_id.clone(),
-
-                                                side:
-                                                    "sell".into(),
-
-                                                token:
-                                                    token_clone.clone(),
-
-                                                price:
-                                                    rapid_sell_price_clone.clone(),
-
-                                                size:
-                                                    sell_amount.to_string(),
-                                                
-                                                executed_price: 
-                                                    None,
-                                                
-                                                executed_size: 
-                                                    None,
-
-                                                status:
-                                                    LocalOrderStatus::Open,
-
-                                                size_matched:
-                                                    "0".into(),
-
-                                                inline_sell_price:
-                                                    "0".into(),
-
-                                                inline_sell_size:
-                                                    "0".into(),
-
-                                                inline_sell_market_type:
-                                                    "FAK".to_string(),
-
-                                                rapid_sell_price:
-                                                    "0".to_string(),
-
-                                                rapid_sell_size:
-                                                    "0".into(),
-
-                                                rapid_sell_state:
-                                                    RapidSellState::Idle,
-
-                                                is_trade_fully_confirmed:
-                                                    false,
-
-                                                associate_trades:
-                                                    vec![],
-
-                                                open_order_response:
-                                                    None,
-
-                                                window_ts:
-                                                    window_ts_clone,
-                                            };
-
-                                        // -------------------------
-                                        // UPDATE TRACKING STATE
-                                        // -------------------------
-                                        {
-                                            let mut tracked =
-                                                tracked_orders_clone
-                                                    .lock()
-                                                    .await;
-
-                                            tracked.insert(
-                                                new_order_id.clone(),
-                                                new_tracked_order.clone(),
-                                            );
-
-                                            if let Some(parent) =
-                                                tracked.get_mut(
-                                                    &parent_order_id
-                                                )
-                                            {
-                                                parent.rapid_sell_state =
-                                                    RapidSellState::Completed;
-
-                                                parent.rapid_sell_size =
-                                                    matched.to_string();
-                                            }
-                                        }
-
-                                        // -------------------------
-                                        // UI UPDATE
-                                        // -------------------------
-                                        let _ =
-                                            update_tx_clone
-                                                .send(
-                                                    WorkerUpdate::OrderAdded {
-                                                        window_ts:
-                                                            window_ts_clone,
-
-                                                        order:
-                                                            new_tracked_order,
-                                                    }
-                                                )
-                                                .await;
-
-                                        let _ =
-                                            update_tx_clone
-                                                .send(
-                                                    WorkerUpdate::Notify {
-                                                        message: format!(
-                                                            "Rapid Sell Placed: {} {} @ {}",
-                                                            sell_amount,
-                                                            token_clone,
-                                                            sell_price
-                                                        ),
-
-                                                        kind:
-                                                            NotificationKind::Success,
-                                                    }
-                                                )
-                                                .await;
-                                    }
-
-                                    // -------------------------
-                                    // PARSE FAILURE
-                                    // -------------------------
-                                    Err(err) => {
-
-                                        let mut tracked =
-                                            tracked_orders_clone
-                                                .lock()
-                                                .await;
-
-                                        if let Some(parent) =
-                                            tracked.get_mut(
-                                                &parent_order_id
-                                            )
-                                        {
-                                            parent.rapid_sell_state =
-                                                RapidSellState::Failed(
-                                                    err.to_string()
-                                                );
-                                        }
-
-                                        let _ =
-                                            update_tx_clone
-                                                .send(
-                                                    WorkerUpdate::Notify {
-                                                        message: format!(
-                                                            "Rapid Sell Parse Failed: {}",
-                                                            err
-                                                        ),
-
-                                                        kind:
-                                                            NotificationKind::Error,
-                                                    }
-                                                )
-                                                .await;
-                                    }
-                                }
-                            }
-
-                            // -------------------------------------
-                            // TRANSPORT FAILURE
-                            // -------------------------------------
-                            Err(err) => {
-
-                                let mut tracked =
-                                    tracked_orders_clone
-                                        .lock()
-                                        .await;
-
-                                if let Some(parent) =
-                                    tracked.get_mut(
-                                        &parent_order_id
-                                    )
-                                {
-                                    parent.rapid_sell_state =
-                                        RapidSellState::Failed(
-                                            err.to_string()
-                                        );
-                                }
-
-                                let _ =
-                                    update_tx_clone
-                                        .send(
-                                            WorkerUpdate::Notify {
-                                                message: format!(
-                                                    "Rapid Sell Failed: {}",
-                                                    err
-                                                ),
-
-                                                kind:
-                                                    NotificationKind::Error,
-                                            }
-                                        )
-                                        .await;
-                            }
-                        }
-                    });
-                }
-            }
-        });
-
-        // -------------------------------------------------------------
-        // TASK 2: High-Speed UI Command Dispatcher Loop
-        // -------------------------------------------------------------
-        tracing::info!("PolymarketWorker: Listening for UI Commands...");
+        // ------------------------------------------------------------------
+        // Task B: Trades polling loop
+        // ------------------------------------------------------------------
+        spawn_trades_polling_loop(
+            Arc::clone(&client),
+            Arc::clone(&state),
+            ctx.clone(),
+            self.poll_config.atomic(Queue::Trades),
+        );
+
+        // ------------------------------------------------------------------
+        // Task C: Rapid-sell automation loop
+        // ------------------------------------------------------------------
+        spawn_rapid_sell_loop(
+            Arc::clone(&client),
+            Arc::clone(&orders_to_poll),
+            Arc::clone(&state),
+            ctx.clone(),
+            self.poll_config.atomic(Queue::RapidSell),
+            self.event_tx.clone(),
+        );
+
+        // ------------------------------------------------------------------
+        // Main loop: UI command dispatcher
+        // ------------------------------------------------------------------
+        info!("PolymarketWorker: listening for commands");
 
         while let Some(cmd) = self.cmd_rx.recv().await {
-            tracing::info!("WORKER: Received command from UI channel: {:?}", cmd);
-            let update_tx = self.update_tx.clone();
-            let ctx = self.ctx.clone();
-            let cmd_orders_list = Arc::clone(&orders_to_poll);
-            let cmd_tracked_orders = Arc::clone(&tracked_orders);
-
-            let clob_client_for_ui_command = clob_client.clone(); // clone the Arc for this task
+            info!(?cmd, "worker received command");
 
             match cmd {
                 UiCommand::InitializeClient { token } => {
-                    tracing::info!("Worker received API token initialization request: {}", token);
-                    // Configure your API client instances with the fresh authorization token here
-                    // Optional: If your background worker manages an HTTP client wrapper, 
-                    // you would pass the token to it here. 
-                    // e.g., *self.client.lock().unwrap() = Some(PolymarketClient::new(token));
+                    info!(%token, "client already initialised at startup; token noted");
                 }
-                UiCommand::UpdatePollInterval {
-                    milliseconds,
-                    queue,
-                } => {
+
+                UiCommand::UpdatePollInterval { milliseconds, queue } => {
                     self.poll_config.set(queue, milliseconds);
-
-                    tracing::info!(
-                        "Updated polling interval to {} ms for {:?}",
-                        milliseconds,
-                        queue
-                    );
+                    info!(?queue, milliseconds, "poll interval updated");
                 }
-                UiCommand::PlaceLimit { side, token, price, size, rapid_price, window_ts } => {
-                    tracing::info!("Worker caught PlaceLimit command!");
-                    tokio::spawn(async move {
-                        /*
-                        let client_guard = client.lock().await;
-                        let client = match &*client_guard {
-                            Some(c) => c,
-                            None => {
-                                tracing::error!("ClobClient not initialized");
-                                ctx.request_repaint();
-                                return;
-                            }
-                        };
-                        */
 
-                        let current_anchor = initiate_stamp_5m();
-                        let slug = build_slug_for_timestamp(current_anchor);
-                        let req = OrderLimitRequest {
+                UiCommand::PlaceLimit { side, token, price, size, rapid_price, window_ts } => {
+                    let client = Arc::clone(&client);
+                    let state = Arc::clone(&state);
+                    let ctx = ctx.clone();
+                    let poll_list = Arc::clone(&orders_to_poll);
+                    let event_tx = self.event_tx.clone();
+
+                    tokio::spawn(async move {
+                        let slug = slug_for_ts(stamp_5m());
+                        let req = LimitRequest {
                             side: side.clone(),
                             token: token.clone(),
                             price: price.clone(),
                             size: size.clone(),
                         };
 
-                        match place_order_limit(clob_client_for_ui_command.clone(), &req, &slug).await {
-                            Ok(order_response) => {
-                                match parse_order_api_response(order_response) {
-                                    Ok(order_id) => {
-                                        let new_order = TrackedOrder {
-                                            id: order_id.clone(),
-                                            side,
-                                            token,
-                                            price,
-                                            size,
-                                            executed_price: None,
-                                            executed_size: None,
-                                            status: LocalOrderStatus::Open,
-                                            size_matched: "0".to_string(),
-                                            inline_sell_price: "0.10".to_string(),
-                                            inline_sell_size: "0".to_string(),
-                                            inline_sell_market_type: "FAK".to_string(),
-                                            rapid_sell_price: rapid_price.to_string(),
-                                            rapid_sell_size: "0".into(),
-                                            rapid_sell_state: RapidSellState::Idle,
-                                            is_trade_fully_confirmed: false,
-                                            associate_trades: vec![],
-                                            open_order_response: None,
-                                            window_ts,
-                                        };
+                        match place_order_limit(Arc::clone(&client), &req, &slug).await {
+                            Ok(resp) => match parse_response(resp) {
+                                Ok(order_id) => {
+                                    let order = TrackedOrder {
+                                        id: order_id.clone(),
+                                        side,
+                                        token,
+                                        price,
+                                        size,
+                                        executed_price: None,
+                                        executed_size: None,
+                                        status: LocalOrderStatus::Open,
+                                        size_matched: "0".into(),
+                                        inline_sell_price: "0.10".into(),
+                                        inline_sell_size: "0".into(),
+                                        inline_sell_market_type: "FAK".into(),
+                                        rapid_sell_price: rapid_price,
+                                        rapid_sell_size: "0".into(),
+                                        rapid_sell_state: RapidSellState::Idle,
+                                        is_trade_fully_confirmed: false,
+                                        associate_trades: vec![],
+                                        open_order_response: None,
+                                        window_ts,
+                                    };
 
-                                        {
-                                            let mut lock = cmd_orders_list.lock().await;
-                                            lock.push((window_ts, order_id.clone()));
-                                        }
+                                    state.orders.insert(order_id.clone(), order);
+                                    poll_list.lock().await.push((window_ts, order_id));
+                                    state.touch();
+                                    ctx.request_repaint();
 
-                                        {
-                                            let mut tracked =
-                                                cmd_tracked_orders
-                                                    .lock()
-                                                    .await;
-
-                                            tracked.insert(
-                                                order_id.clone(),
-                                                new_order.clone(),
-                                            );
-                                        }
-
-                                        /*
-                                        tracked_orders
-                                            .lock()
-                                            .await
-                                            .insert(order_id.clone(), new_order.clone());
-                                            */
-
-                                        let _ = update_tx.send(WorkerUpdate::OrderAdded { window_ts, order: new_order }).await;
-                                        let _ = update_tx
-                                            .send(WorkerUpdate::Notify {
-                                                message: "Limit Order Placed Successfully!".into(),
-                                                kind: NotificationKind::Success,
-                                            })
-                                            .await;
-                                    }
-                                    Err(domain_err) => {
-                                        // Catches internal engine rejections (success: false) or API errors (400, 401, etc.)
-                                        let _ = update_tx
-                                            .send(WorkerUpdate::Notify {
-                                                message: format!("Limit Processing Failed: {}", domain_err),
-                                                kind: NotificationKind::Error,
-                                            })
-                                            .await;
-                                    }
+                                    notify(&event_tx, "Limit Order Placed", NotificationKind::Success).await;
                                 }
-                            }
+                                Err(e) => {
+                                    notify(&event_tx, &format!("Limit rejected: {e}"), NotificationKind::Error).await;
+                                }
+                            },
                             Err(e) => {
-                                // Catches transport/network layer errors returned directly by place_order_limit
-                                let _ = update_tx
-                                    .send(WorkerUpdate::Notify {
-                                        message: format!("Limit Transport Failed: {}", e),
-                                        kind: NotificationKind::Error,
-                                    })
-                                    .await;
+                                notify(&event_tx, &format!("Limit transport error: {e}"), NotificationKind::Error).await;
                             }
                         }
                         ctx.request_repaint();
@@ -1194,233 +254,109 @@ impl PolymarketWorker {
                 }
 
                 UiCommand::PlaceMarket { side, token, usdc, shares, order_type, window_ts } => {
-                    tracing::info!("Worker caught PlaceMarket command!");
+                    let client = Arc::clone(&client);
+                    let state = Arc::clone(&state);
+                    let ctx = ctx.clone();
+                    let poll_list = Arc::clone(&orders_to_poll);
+                    let event_tx = self.event_tx.clone();
+
                     tokio::spawn(async move {
-                        let current_anchor = initiate_stamp_5m();
-                        let slug = build_slug_for_timestamp(current_anchor);
-                        let req = OrderMarketRequest {
+                        let slug = slug_for_ts(stamp_5m());
+                        let req = MarketRequest {
                             side: side.clone(),
                             token: token.clone(),
-                            usdc,
-                            shares,
-                            order_type,
+                            usdc: usdc.clone(),
+                            shares: shares.clone(),
+                            order_type: order_type.clone(),
                         };
 
-                        match place_order_market(clob_client_for_ui_command.clone(), &req, &slug).await {
-                            Ok(order_response) => {
-                                match parse_order_api_response(order_response) {
-                                    Ok(order_id) => {
-                                        let new_order = TrackedOrder {
-                                            id: order_id.clone(),
-                                            side,
-                                            token,
-                                            price: "Market".into(),
-                                            size: "Market".into(),
-                                            executed_price: None,
-                                            executed_size: None,
-                                            /*
-                                            status: LocalOrderStatus::FullyFilled,
-                                            size_matched: "Full".to_string(),
-                                            */
-                                            status: LocalOrderStatus::Open,
-                                            size_matched: "0".to_string(),
-                                            inline_sell_price: "0.50".to_string(),
-                                            inline_sell_size: "0".to_string(),
-                                            inline_sell_market_type: "FAK".to_string(),
-                                            rapid_sell_price: "0.00".to_string(),
-                                            rapid_sell_size: "0".into(),
-                                            rapid_sell_state: RapidSellState::Idle,
-                                            is_trade_fully_confirmed: false,
-                                            associate_trades: vec![],
-                                            open_order_response: None,
-                                            window_ts,
-                                        };
+                        match place_order_market(Arc::clone(&client), &req, &slug).await {
+                            Ok(resp) => match parse_response(resp) {
+                                Ok(order_id) => {
+                                    let order = TrackedOrder {
+                                        id: order_id.clone(),
+                                        side,
+                                        token,
+                                        price: "Market".into(),
+                                        size: "Market".into(),
+                                        executed_price: None,
+                                        executed_size: None,
+                                        status: LocalOrderStatus::Open,
+                                        size_matched: "0".into(),
+                                        inline_sell_price: "0.50".into(),
+                                        inline_sell_size: "0".into(),
+                                        inline_sell_market_type: "FAK".into(),
+                                        rapid_sell_price: "0.00".into(),
+                                        rapid_sell_size: "0".into(),
+                                        rapid_sell_state: RapidSellState::Idle,
+                                        is_trade_fully_confirmed: false,
+                                        associate_trades: vec![],
+                                        open_order_response: None,
+                                        window_ts,
+                                    };
 
-                                        {
-                                            let mut lock = cmd_orders_list.lock().await;
-                                            lock.push((window_ts, order_id.clone()));
-                                        }
+                                    state.orders.insert(order_id.clone(), order);
+                                    poll_list.lock().await.push((window_ts, order_id));
+                                    state.touch();
+                                    ctx.request_repaint();
 
-                                        {
-                                            let mut tracked =
-                                                cmd_tracked_orders
-                                                    .lock()
-                                                    .await;
-
-                                            tracked.insert(
-                                                order_id.clone(),
-                                                new_order.clone(),
-                                            );
-                                        }
-
-                                        let _ = update_tx.send(WorkerUpdate::OrderAdded { window_ts, order: new_order }).await;
-                                        let _ = update_tx
-                                            .send(WorkerUpdate::Notify {
-                                                message: "Market Order Filled Successfully!".into(),
-                                                kind: NotificationKind::Success,
-                                            })
-                                            .await;
-                                    }
-                                    Err(domain_err) => {
-                                        // Catches internal engine rejections (success: false) or API errors (400, 401, etc.)
-                                        let _ = update_tx
-                                            .send(WorkerUpdate::Notify {
-                                                message: format!("Market Processing Failed: {}", domain_err),
-                                                kind: NotificationKind::Error,
-                                            })
-                                            .await;
-                                    }
+                                    notify(&event_tx, "Market Order Placed", NotificationKind::Success).await;
                                 }
-                            }
+                                Err(e) => {
+                                    notify(&event_tx, &format!("Market rejected: {e}"), NotificationKind::Error).await;
+                                }
+                            },
                             Err(e) => {
-                                // Catches transport/network layer errors returned directly by place_order_market
-                                let _ = update_tx
-                                    .send(WorkerUpdate::Notify {
-                                        message: format!("Market Transport Failed: {}", e),
-                                        kind: NotificationKind::Error,
-                                    })
-                                    .await;
+                                notify(&event_tx, &format!("Market transport error: {e}"), NotificationKind::Error).await;
                             }
                         }
                         ctx.request_repaint();
                     });
                 }
 
-                UiCommand::CheckStatus { order_id, window_ts } => {
-                    tracing::info!("Worker caught CheckStatus command!");
-                    let update_tx = update_tx.clone();
+                UiCommand::CheckStatus { order_id, window_ts: _ } => {
+                    let client = Arc::clone(&client);
+                    let state = Arc::clone(&state);
                     let ctx = ctx.clone();
 
                     tokio::spawn(async move {
-                        // Assuming get_order_status returns anyhow::Result<OpenOrderResponse>
-                        if let Ok(order_info) = get_order_status(clob_client_for_ui_command.clone(), &order_id).await {
-                            
-                            // 1. Math check to differentiate Full vs Partial execution states
-                            //let is_fully_filled = order_info.size_matched >= order_info.original_size;
-                            let tolerance_pct = dec!(0.005); // 0.5%
-                            let is_fully_filled =
-                                order_info.size_matched >= order_info.original_size * (dec!(1.0) - tolerance_pct);
-                            let matched_string = format!("{}/{}", order_info.size_matched, order_info.original_size);
-
-                            // 2. Map structural response conditions to local UI lifecycle tokens
-                            let target_status = match order_info.status {
-                                OrderStatusType::Live => {
-                                    if order_info.size_matched > rust_decimal::Decimal::ZERO {
-                                        LocalOrderStatus::PartiallyFilled {
-                                            filled: order_info.size_matched.to_string(),
-                                        }
-                                    } else {
-                                        LocalOrderStatus::Open
-                                    }
-                                }
-                                OrderStatusType::Matched => {
-                                    if is_fully_filled {
-                                        LocalOrderStatus::FullyFilled
-                                    } else {
-                                        LocalOrderStatus::PartiallyFilled {
-                                            filled: order_info.size_matched.to_string(),
-                                        }
-                                    }
-                                }
-                                OrderStatusType::Canceled => {
-                                    LocalOrderStatus::Canceled
-                                }
-                                OrderStatusType::Unknown(ref reason) => {
-                                    if reason == "INVALID" {
-                                        LocalOrderStatus::Canceled
-                                    } else {
-                                        tracing::warn!(
-                                            "Encountered unknown order status '{}' for order {}",
-                                            reason,
-                                            order_id
-                                        );
-                                        LocalOrderStatus::Canceled
-                                    }
-                                }
-                                _ => {
-                                    tracing::warn!("Encountered unknown non-exhaustive status type during manual check for order {}", order_id);
-                                    LocalOrderStatus::Canceled
-                                }
-                            };
-
-                            // 3. Dispatch uniform status down to the egui view model
-                            let _ = update_tx
-                                .send(WorkerUpdate::OrderUpdated {
-                                    window_ts,
-                                    order_id: order_id.clone(),
-                                    status: target_status.clone(),
-                                    matched: order_info.size_matched.to_string(),
-                                    open_order_response: Some(order_info.clone()),
-                                })
-                                .await;
-
-                            // 4. Also update the Worker State
-                            if let Some(o) = cmd_tracked_orders
-                                .lock()
-                                .await
-                                .get_mut(&order_id)
-                            {
-                                // keep worker state in sync with API truth
-                                o.status = target_status;
-                                o.size_matched = order_info
-                                    .size_matched
-                                    .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero)
-                                    .to_string();
-                            }
+                        if let Ok(info) = get_order_status(Arc::clone(&client), &order_id).await {
+                            apply_order_status_update(&state, &order_id, &info, false);
+                            state.touch();
+                            ctx.request_repaint();
                         }
-                        ctx.request_repaint();
                     });
                 }
 
-                UiCommand::CancelIndividual { order_id, window_ts } => {
-                    tracing::info!("Worker caught CancelIndividual command!");
+                UiCommand::CancelIndividual { order_id, window_ts: _ } => {
+                    let client = Arc::clone(&client);
+                    let state = Arc::clone(&state);
+                    let ctx = ctx.clone();
+                    let poll_list = Arc::clone(&orders_to_poll);
+                    let event_tx = self.event_tx.clone();
+
                     tokio::spawn(async move {
-                        match cancel_order(clob_client_for_ui_command.clone(), &order_id).await {
-                            Ok(cancel_data) => {
-                                // Verify that our specific single order ID successfully made it into the canceled list
-                                if cancel_data.canceled.contains(&order_id) {
-                                    let _ = update_tx
-                                        .send(WorkerUpdate::OrderUpdated {
-                                            window_ts,
-                                            order_id: order_id.clone(),
-                                            status: LocalOrderStatus::Canceled,
-                                            matched: "Canceled".to_string(),
-                                            open_order_response: None,
-                                        })
-                                        .await;
-
-                                    {
-                                        let mut lock = cmd_orders_list.lock().await;
-                                        lock.retain(|(_, id)| id != &order_id);
+                        match cancel_order(Arc::clone(&client), &order_id).await {
+                            Ok(resp) => {
+                                if resp.canceled.contains(&order_id) {
+                                    if let Some(mut o) = state.orders.get_mut(&order_id) {
+                                        o.status = LocalOrderStatus::Canceled;
                                     }
-
-                                    let _ = update_tx
-                                        .send(WorkerUpdate::Notify {
-                                            message: "Order Cancelled Successfully".into(),
-                                            kind: NotificationKind::Success,
-                                        })
-                                        .await;
+                                    poll_list.lock().await.retain(|(_, id)| id != &order_id);
+                                    state.touch();
+                                    ctx.request_repaint();
+                                    notify(&event_tx, "Order cancelled", NotificationKind::Success).await;
                                 } else {
-                                    // If it failed, extract the exact error string from the HashMap
-                                    let reason = cancel_data.not_canceled.get(&order_id)
+                                    let reason = resp
+                                        .not_canceled
+                                        .get(&order_id)
                                         .map(|s| s.as_str())
-                                        .unwrap_or("Unknown exchange rejection reason");
-
-                                    let _ = update_tx
-                                        .send(WorkerUpdate::Notify {
-                                            message: format!("Cancellation Rejected: {}", reason),
-                                            kind: NotificationKind::Error,
-                                        })
-                                        .await;
+                                        .unwrap_or("unknown reason");
+                                    notify(&event_tx, &format!("Cancel rejected: {reason}"), NotificationKind::Error).await;
                                 }
                             }
                             Err(e) => {
-                                let _ = update_tx
-                                    .send(WorkerUpdate::Notify {
-                                        message: format!("Cancellation Transport Failed: {}", e),
-                                        kind: NotificationKind::Error,
-                                    })
-                                    .await;
+                                notify(&event_tx, &format!("Cancel transport error: {e}"), NotificationKind::Error).await;
                             }
                         }
                         ctx.request_repaint();
@@ -1428,509 +364,720 @@ impl PolymarketWorker {
                 }
 
                 UiCommand::CancelAllInWindow { window_ts } => {
-                    tracing::info!("Worker caught CancelAllInWindow command!");
-                    let cmd_orders_list = Arc::clone(&cmd_orders_list);
-                    let update_tx = update_tx.clone();
+                    let client = Arc::clone(&client);
+                    let state = Arc::clone(&state);
                     let ctx = ctx.clone();
+                    let poll_list = Arc::clone(&orders_to_poll);
+                    let event_tx = self.event_tx.clone();
 
                     tokio::spawn(async move {
-                        // 1. Gather all local order IDs inside this window_ts block
-                        let local_window_ids: Vec<String> = {
-                            let lock = cmd_orders_list.lock().await;
+                        let local_ids: Vec<String> = {
+                            let lock = poll_list.lock().await;
                             lock.iter()
                                 .filter(|(ts, _)| *ts == window_ts)
                                 .map(|(_, id)| id.clone())
                                 .collect()
                         };
 
-                        // 2. Dispatch the single batch cancellation request directly to Polymarket
-                        // cancel_all_orders() returns anyhow::Result<CancelOrdersResponse>
-                        match cancel_all_orders(clob_client_for_ui_command.clone()).await {
-                            Ok(api_summary) => {
-                                // api_summary.canceled is natively a Vec<String>
-                                let canceled_count = api_summary.canceled.len();
-
-                                // 3. Update local egui status for orders successfully dropped by the API
-                                for order_id in local_window_ids {
-                                    // Direct lookup inside the standard Vec<String>
-                                    if api_summary.canceled.contains(&order_id) {
-                                        let _ = update_tx
-                                            .send(WorkerUpdate::OrderUpdated {
-                                                window_ts,
-                                                order_id: order_id.clone(),
-                                                status: LocalOrderStatus::Canceled,
-                                                matched: "Canceled".to_string(),
-                                                open_order_response: None,
-                                            })
-                                            .await;
-
-                                        // Remove this specific confirmed order from your local master tracking list
-                                        {
-                                            let mut lock = cmd_orders_list.lock().await;
-                                            lock.retain(|(_, id)| id != &order_id);
+                        match cancel_all_orders(Arc::clone(&client)).await {
+                            Ok(resp) => {
+                                let count = resp.canceled.len();
+                                for id in &local_ids {
+                                    if resp.canceled.contains(id) {
+                                        if let Some(mut o) = state.orders.get_mut(id) {
+                                            o.status = LocalOrderStatus::Canceled;
                                         }
-                                    } else {
-                                        // Check if the API explicitly provided an execution rejection reason string
-                                        if let Some(reason) = api_summary.not_canceled.get(&order_id) {
-                                            tracing::warn!(
-                                                "Order {} in window {} not canceled. Reason: {}", 
-                                                order_id, window_ts, reason
-                                            );
-                                        } else {
-                                            tracing::warn!(
-                                                "Order {} in window {} was omitted from API response fields", 
-                                                order_id, window_ts
-                                            );
-                                        }
+                                        poll_list.lock().await.retain(|(_, oid)| oid != id);
                                     }
                                 }
-
-                                // 4. Provide feedback using the straight length of the native vector
-                                let _ = update_tx
-                                    .send(WorkerUpdate::Notify {
-                                        message: format!("Batch Cancel Finished! Canceled {} orders.", canceled_count),
-                                        kind: NotificationKind::Success,
-                                    })
-                                    .await;
+                                state.touch();
+                                ctx.request_repaint();
+                                notify(&event_tx, &format!("Batch cancel: {count} cancelled"), NotificationKind::Success).await;
                             }
                             Err(e) => {
-                                let _ = update_tx
-                                    .send(WorkerUpdate::Notify {
-                                        message: format!("Batch Cancel Failed: {}", e),
-                                        kind: NotificationKind::Error,
-                                    })
-                                    .await;
+                                notify(&event_tx, &format!("Batch cancel error: {e}"), NotificationKind::Error).await;
                             }
                         }
                         ctx.request_repaint();
-                    });    
+                    });
                 }
 
-                UiCommand::StartMarketFeed {
-                    window_ts,
-                    slug,
-                } => {
-
-                    let mut tasks =
-                        self.market_tasks.lock().await;
-
-                    if tasks.contains_key(&window_ts) {
-                        tracing::info!("Feed already running for window {}", window_ts);
-                            //return;
-                            //break;
-                            continue;
+                UiCommand::StartMarketFeed { window_ts, slug } => {
+                    if state.market_feeds.contains_key(&window_ts) {
+                        info!(window_ts, "feed already running, skipping");
+                        continue;
                     }
-
-                    let shutdown =
-                        Arc::new(tokio::sync::Notify::new());
-
-                    let prices: SharedMarketPrices =
-                        Arc::new(
-                            ArcSwap::from_pointee(
-                                MarketPrices {
-
-                                    up_price: 0.0,
-                                    down_price: 0.0,
-
-                                    up_asset_id:
-                                        Arc::<str>::from(""),
-
-                                    down_asset_id:
-                                        Arc::<str>::from(""),
-
-                                    connected: false,
-                                    stale: true,
-
-                                    last_ts: 0,
-
-                                    error: None,
-                                }
-                            )
-                        );
-
-                    let handle =
-                        MarketFeedHandle {
-                            shutdown: shutdown.clone(),
-                        };
-
-                    tasks.insert(
-                        window_ts,
-                        handle.clone(),
-                    );
-
-                    // ---------------------------------------------------
-                    // SEND ARC SWAP HANDLE TO UI
-                    // ---------------------------------------------------
-                    let _ = self.update_tx.send(
-                        WorkerUpdate::MarketFeedStarted {
-                            window_ts,
-                            prices: prices.clone(),
-                        }
-                    ).await;
-
-                    let gamma =
-                        GammaClient::default();
-
-                    spawn_market_feed(
-                        slug,
-                        prices,
-                        shutdown,
-                        gamma,
-                    )
-                    .await;
-
-                    info!(
-                        "market feed started: {}",
-                        window_ts
-                    );
+                    let event_tx = self.event_tx.clone();
+                    start_market_feed(window_ts, slug, Arc::clone(&state), ctx.clone()).await;
+                    let _ = event_tx
+                        .send(WorkerEvent::MarketFeedStarted { window_ts })
+                        .await;
                 }
 
-                UiCommand::StopMarketFeed {
-                    window_ts,
-                } => {
-
-                    let mut tasks =
-                        self.market_tasks.lock().await;
-
-                    if let Some(feed) =
-                        tasks.remove(&window_ts)
-                    {
-                        feed.shutdown.notify_waiters();
-
-                        info!(
-                            "market feed stopped: {}",
-                            window_ts
-                        );
+                UiCommand::StopMarketFeed { window_ts } => {
+                    if let Some((_, handle)) = state.market_feeds.remove(&window_ts) {
+                        handle.shutdown.notify_waiters();
+                        info!(window_ts, "feed stopped");
                     }
                 }
             }
         }
-        tracing::warn!("Worker command channel was dropped/closed.");
 
+        warn!("PolymarketWorker: command channel closed");
         Ok(())
     }
 }
 
-// ==========================================
-// Core Business Logic (Your SDK Code)
-// ==========================================
+// ---------------------------------------------------------------------------
+// Polling task A: orders
+// ---------------------------------------------------------------------------
 
-pub struct Timer {
-    label: String,
+fn spawn_orders_polling_loop(
+    client: SharedClient,
+    orders_to_poll: Arc<Mutex<Vec<(u64, String)>>>,
+    state: SharedAppState,
+    ctx: egui::Context,
+    interval_cell: Arc<std::sync::atomic::AtomicU64>,
+    event_tx: Sender<WorkerEvent>,
+) {
+    tokio::spawn(async move {
+        let mut current_ms = interval_cell.load(Ordering::Relaxed);
+        let mut interval = make_interval(current_ms);
+
+        loop {
+            let latest = interval_cell.load(Ordering::Relaxed);
+            if latest != current_ms {
+                current_ms = latest;
+                interval = make_interval(current_ms);
+                info!(current_ms, "orders poll interval updated");
+            }
+
+            if current_ms == 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+
+            interval.tick().await;
+
+            let snapshot: Vec<(u64, String)> = {
+                let lock = orders_to_poll.lock().await;
+                lock.clone()
+            };
+
+            if snapshot.is_empty() {
+                continue;
+            }
+
+            let mut to_remove = Vec::new();
+
+            for (window_ts, order_id) in &snapshot {
+                let Ok(info) = get_order_status(Arc::clone(&client), order_id).await else {
+                    continue;
+                };
+
+                let remove = apply_order_status_update(&state, order_id, &info, true);
+                if remove {
+                    to_remove.push((*window_ts, order_id.clone()));
+                }
+            }
+
+            if !to_remove.is_empty() {
+                let mut lock = orders_to_poll.lock().await;
+                lock.retain(|item| !to_remove.contains(item));
+            }
+
+            if !snapshot.is_empty() {
+                state.touch();
+                ctx.request_repaint();
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Polling task B: trades
+// ---------------------------------------------------------------------------
+
+fn spawn_trades_polling_loop(
+    client: SharedClient,
+    state: SharedAppState,
+    ctx: egui::Context,
+    interval_cell: Arc<std::sync::atomic::AtomicU64>,
+) {
+    tokio::spawn(async move {
+        let mut current_ms = interval_cell.load(Ordering::Relaxed);
+        let mut interval = make_interval(current_ms);
+
+        loop {
+            let latest = interval_cell.load(Ordering::Relaxed);
+            if latest != current_ms {
+                current_ms = latest;
+                interval = make_interval(current_ms);
+                info!(current_ms, "trades poll interval updated");
+            }
+
+            if current_ms == 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+
+            interval.tick().await;
+
+            if state.orders.is_empty() {
+                continue;
+            }
+
+            // Deduplicate by window so we make at most one trades call per
+            // active market.
+            let mut seen_slugs = std::collections::HashSet::new();
+
+            for entry in state.orders.iter() {
+                let order = entry.value();
+                let slug = slug_for_ts(stamp_5m());
+
+                if !seen_slugs.insert(slug.clone()) {
+                    continue;
+                }
+
+                let condition_id = {
+                    let cache = MARKET_CACHE.lock().unwrap();
+                    cache.get(&slug).and_then(|m| m.condition_id)
+                };
+
+                let Some(condition_id) = condition_id else {
+                    continue;
+                };
+
+                let mut req = TradesRequest::builder().build();
+                req.market = Some(condition_id);
+
+                let result = {
+                    let guard = client.lock().await;
+                    let Some(c) = guard.as_ref() else {
+                        warn!("trades poll: client unavailable");
+                        continue;
+                    };
+                    c.trades(&req, None).await
+                };
+
+                match result {
+                    Ok(page) => {
+                        for trade in page.data {
+                            state.trades.insert(trade.id.clone(), trade);
+                        }
+                        state.touch();
+                        ctx.request_repaint();
+                    }
+                    Err(e) => {
+                        tracing::error!(%slug, error=%e, "trades poll failed");
+                    }
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Polling task C: rapid-sell automation
+// ---------------------------------------------------------------------------
+
+fn spawn_rapid_sell_loop(
+    client: SharedClient,
+    orders_to_poll: Arc<Mutex<Vec<(u64, String)>>>,
+    state: SharedAppState,
+    ctx: egui::Context,
+    interval_cell: Arc<std::sync::atomic::AtomicU64>,
+    event_tx: Sender<WorkerEvent>,
+) {
+    tokio::spawn(async move {
+        let mut current_ms = interval_cell.load(Ordering::Relaxed);
+        let mut interval = make_interval(current_ms);
+
+        loop {
+            let latest = interval_cell.load(Ordering::Relaxed);
+            if latest != current_ms {
+                current_ms = latest;
+                interval = make_interval(current_ms);
+                info!(current_ms, "rapid-sell interval updated");
+            }
+
+            if current_ms == 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+
+            interval.tick().await;
+
+            // Collect candidates without holding the DashMap ref across await.
+            let candidates: Vec<TrackedOrder> = state
+                .orders
+                .iter()
+                .filter(|e| {
+                    let o = e.value();
+                    o.side.eq_ignore_ascii_case("buy")
+                        && matches!(o.status, LocalOrderStatus::TradeConfirmed)
+                        && o.is_trade_fully_confirmed
+                        && matches!(
+                            o.rapid_sell_state,
+                            RapidSellState::Idle | RapidSellState::Failed(_)
+                        )
+                })
+                .map(|e| e.value().clone())
+                .collect();
+
+            for order in candidates {
+                let matched = Decimal::from_str(&order.size_matched).unwrap_or_default();
+                let already_sold = Decimal::from_str(&order.rapid_sell_size).unwrap_or_default();
+                let sell_price = Decimal::from_str(&order.rapid_sell_price).unwrap_or_default();
+                let sell_amount = (matched - already_sold).max(Decimal::ZERO);
+
+                if sell_price <= Decimal::ZERO || sell_amount < Decimal::from(5) {
+                    continue;
+                }
+
+                // Mark pending immediately to prevent double-fire.
+                if let Some(mut o) = state.orders.get_mut(&order.id) {
+                    o.rapid_sell_state = RapidSellState::Pending;
+                }
+
+                let client = Arc::clone(&client);
+                let state = Arc::clone(&state);
+                let ctx = ctx.clone();
+                let poll_list = Arc::clone(&orders_to_poll);
+                let event_tx = event_tx.clone();
+                let parent_id = order.id.clone();
+                let token = order.token.clone();
+                let window_ts = order.window_ts;
+                let rapid_price = order.rapid_sell_price.clone();
+
+                tokio::spawn(async move {
+                    let slug = slug_for_ts(stamp_5m());
+                    let req = LimitRequest {
+                        side: "sell".into(),
+                        token: token.clone(),
+                        price: rapid_price.clone(),
+                        size: sell_amount.to_string(),
+                    };
+
+                    match place_order_limit(Arc::clone(&client), &req, &slug).await {
+                        Ok(resp) => match parse_response(resp) {
+                            Ok(new_id) => {
+                                let sell_order = TrackedOrder {
+                                    id: new_id.clone(),
+                                    side: "sell".into(),
+                                    token: token.clone(),
+                                    price: rapid_price.clone(),
+                                    size: sell_amount.to_string(),
+                                    executed_price: None,
+                                    executed_size: None,
+                                    status: LocalOrderStatus::Open,
+                                    size_matched: "0".into(),
+                                    inline_sell_price: "0".into(),
+                                    inline_sell_size: "0".into(),
+                                    inline_sell_market_type: "FAK".into(),
+                                    rapid_sell_price: "0".into(),
+                                    rapid_sell_size: "0".into(),
+                                    rapid_sell_state: RapidSellState::Idle,
+                                    is_trade_fully_confirmed: false,
+                                    associate_trades: vec![],
+                                    open_order_response: None,
+                                    window_ts,
+                                };
+
+                                state.orders.insert(new_id.clone(), sell_order);
+                                poll_list.lock().await.push((window_ts, new_id.clone()));
+
+                                // Update parent order.
+                                if let Some(mut parent) = state.orders.get_mut(&parent_id) {
+                                    parent.rapid_sell_state = RapidSellState::Completed;
+                                    parent.rapid_sell_size = matched.to_string();
+                                }
+
+                                state.touch();
+                                ctx.request_repaint();
+
+                                notify(
+                                    &event_tx,
+                                    &format!("Rapid Sell placed: {sell_amount} {token} @ {rapid_price}"),
+                                    NotificationKind::Success,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                if let Some(mut o) = state.orders.get_mut(&parent_id) {
+                                    o.rapid_sell_state = RapidSellState::Failed(e.to_string());
+                                }
+                                notify(&event_tx, &format!("Rapid Sell rejected: {e}"), NotificationKind::Error).await;
+                            }
+                        },
+                        Err(e) => {
+                            if let Some(mut o) = state.orders.get_mut(&parent_id) {
+                                o.rapid_sell_state = RapidSellState::Failed(e.to_string());
+                            }
+                            notify(&event_tx, &format!("Rapid Sell transport error: {e}"), NotificationKind::Error).await;
+                        }
+                    }
+                    ctx.request_repaint();
+                });
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// State mutation helper (shared between polling loop and CheckStatus)
+// ---------------------------------------------------------------------------
+
+/// Apply an [`OpenOrderResponse`] to `AppState::orders`.
+///
+/// Returns `true` if the order has reached a terminal state and should be
+/// removed from the polling list.
+fn apply_order_status_update(
+    state: &AppState,
+    order_id: &str,
+    info: &OpenOrderResponse,
+    check_trades: bool,
+) -> bool {
+    let tolerance = dec!(0.005);
+    let is_fully_filled =
+        info.size_matched >= info.original_size * (dec!(1.0) - tolerance);
+
+    let is_trade_confirmed = if check_trades && !info.associate_trades.is_empty() {
+        let confirmed: Decimal = info
+            .associate_trades
+            .iter()
+            .filter_map(|tid| state.trades.get(tid))
+            .filter(|t| matches!(t.status, TradeStatusType::Confirmed))
+            .map(|t| t.value().size)
+            .sum();
+        confirmed >= info.original_size * (dec!(1.0) - tolerance)
+    } else {
+        false
+    };
+
+    let terminal;
+    let new_status = match &info.status {
+        OrderStatusType::Live => {
+            terminal = false;
+            if info.size_matched > Decimal::ZERO {
+                LocalOrderStatus::PartiallyFilled {
+                    filled: info.size_matched.to_string(),
+                }
+            } else {
+                LocalOrderStatus::Open
+            }
+        }
+        OrderStatusType::Matched => {
+            if is_fully_filled {
+                if is_trade_confirmed {
+                    terminal = true;
+                    LocalOrderStatus::TradeConfirmed
+                } else {
+                    terminal = false;
+                    LocalOrderStatus::FullyFilled
+                }
+            } else {
+                terminal = false;
+                LocalOrderStatus::PartiallyFilled {
+                    filled: info.size_matched.to_string(),
+                }
+            }
+        }
+        OrderStatusType::Canceled => {
+            terminal = true;
+            LocalOrderStatus::Canceled
+        }
+        OrderStatusType::Unknown(reason) => {
+            terminal = true;
+            if reason == "INVALID" {
+                LocalOrderStatus::Canceled
+            } else {
+                warn!(%reason, %order_id, "unknown order status");
+                LocalOrderStatus::Canceled
+            }
+        }
+        _ => {
+            terminal = true;
+            warn!(%order_id, "non-exhaustive order status variant");
+            LocalOrderStatus::Canceled
+        }
+    };
+
+    if let Some(mut o) = state.orders.get_mut(order_id) {
+        o.status = new_status;
+        o.size_matched = info
+            .size_matched
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero)
+            .to_string();
+
+        if info.size_matched > Decimal::ZERO {
+            o.executed_size = Some(o.size_matched.clone());
+            o.inline_sell_size = o.size_matched.clone();
+            o.executed_price = Some(
+                info.price
+                    .round_dp_with_strategy(4, rust_decimal::RoundingStrategy::ToZero)
+                    .to_string(),
+            );
+        }
+
+        o.is_trade_fully_confirmed = is_trade_confirmed;
+        o.associate_trades = info.associate_trades.clone();
+        o.open_order_response = Some(info.clone());
+    }
+
+    terminal
+}
+
+// ---------------------------------------------------------------------------
+// Notification helper
+// ---------------------------------------------------------------------------
+
+async fn notify(tx: &Sender<WorkerEvent>, msg: &str, kind: NotificationKind) {
+    let _ = tx
+        .send(WorkerEvent::Notify {
+            message: msg.to_owned(),
+            kind,
+        })
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// Interval helper
+// ---------------------------------------------------------------------------
+
+fn make_interval(ms: u64) -> tokio::time::Interval {
+    tokio::time::interval(Duration::from_millis(ms.max(1)))
+}
+
+// ---------------------------------------------------------------------------
+// Timer utility
+// ---------------------------------------------------------------------------
+
+struct Timer {
+    label: &'static str,
     start: Instant,
 }
 
 impl Timer {
-    fn start(label: &str) -> Self {
-        Timer {
-            label: label.to_string(),
-            start: Instant::now(),
-        }
+    fn start(label: &'static str) -> Self {
+        Self { label, start: Instant::now() }
     }
-
     fn done(&self) {
-        let elapsed = self.start.elapsed();
-        info!("Step '{}' completed in {:?}", self.label, elapsed);
+        info!(label = self.label, elapsed = ?self.start.elapsed(), "step complete");
     }
 }
 
 macro_rules! timed {
-    ($label:expr, $block:block) => {{
-        let timer = Timer::start($label);
-        let result = { $block };
-        timer.done();
+    ($label:literal, $block:block) => {{
+        let _t = Timer::start($label);
+        let result = $block;
+        _t.done();
         result
     }};
 }
 
-pub fn initiate_stamp_5m() -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs();
-    now - (now % 300)
+// ---------------------------------------------------------------------------
+// Request types (internal only)
+// ---------------------------------------------------------------------------
+
+struct LimitRequest {
+    side: String,
+    token: String,
+    price: String,
+    size: String,
 }
 
-pub fn build_slug_for_timestamp(ts: u64) -> String {
-    format!("btc-updown-5m-{}", ts)
+struct MarketRequest {
+    side: String,
+    token: String,
+    usdc: Option<String>,
+    shares: Option<String>,
+    order_type: Option<String>,
 }
 
-pub fn build_slug() -> String {
-    build_slug_for_timestamp(initiate_stamp_5m())
-}
+// ---------------------------------------------------------------------------
+// SDK helpers
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Debug)]
-pub struct ApiErrorResponse {
-    pub error: String,
+struct ApiError {
+    error: String,
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(untagged)]
-enum ApiResponsePayload {
-    Success(PostOrderResponse),
-    Failure(ApiErrorResponse),
-}
-
-/// Parses the JSON response cleanly by inspecting keys explicitly
-pub fn parse_order_api_response(
-    order_data: PostOrderResponse,
-) -> Result<String, Error> {
-    // 1. Check the internal business logic success flag
-    if !order_data.success {
-        let msg = order_data.error_msg.unwrap_or_else(|| "Order rejected".into());
-        return Err(Error::validation(format!("Engine Reject: {}", msg)));
+fn parse_response(resp: PostOrderResponse) -> Result<String, Error> {
+    if !resp.success {
+        let msg = resp.error_msg.unwrap_or_else(|| "Order rejected".into());
+        return Err(Error::validation(format!("Engine reject: {msg}")));
     }
-    
-    // 2. Return the clean order ID
-    Ok(order_data.order_id)
+    Ok(resp.order_id)
 }
 
 #[instrument(skip(client))]
-async fn get_or_fetch_market_by_slug(
+pub async fn get_or_fetch_token_ids(
     client: &GammaClient,
     slug: &str,
-) -> anyhow::Result<Market> {
-    {
-        let markets = MARKET_BY_SLUG_CACHE.lock().unwrap();
+) -> anyhow::Result<Vec<String>> {
+    let market = get_or_fetch_market(client, slug).await?;
+    Ok(market
+        .clob_token_ids
+        .as_ref()
+        .map(|t| t.iter().map(|x| x.to_string()).collect())
+        .unwrap_or_default())
+}
 
-        if let Some(market) = markets.get(slug) {
-            return Ok(market.clone());
+#[instrument(skip(client))]
+async fn get_or_fetch_market(client: &GammaClient, slug: &str) -> anyhow::Result<Market> {
+    {
+        let cache = MARKET_CACHE.lock().unwrap();
+        if let Some(m) = cache.get(slug) {
+            return Ok(m.clone());
         }
     }
 
-    let market_request = MarketBySlugRequest::builder()
-        .slug(slug)
-        .build();
-
-    let market = client.market_by_slug(&market_request).await?;
+    let req = MarketBySlugRequest::builder().slug(slug).build();
+    let market = client.market_by_slug(&req).await?;
 
     {
-        let mut markets = MARKET_BY_SLUG_CACHE.lock().unwrap();
-
-        // optional: keep only latest cached market
-        markets.clear();
-
-        markets.insert(slug.to_string(), market.clone());
+        let mut cache = MARKET_CACHE.lock().unwrap();
+        cache.clear();
+        cache.insert(slug.to_string(), market.clone());
     }
 
     Ok(market)
 }
 
-/*
-#[instrument(skip(client))]
-async fn get_or_fetch_token_ids(client: &GammaClient, slug: &str) -> anyhow::Result<Vec<String>> {
-    {
-        let tokens = TOKEN_IDS_CACHE.lock().unwrap();
-        if let Some(ids) = tokens.get(slug) {
-            return Ok(ids.clone());
-        }
-    }
-    let market_request = MarketBySlugRequest::builder().slug(slug).build();
-    let market = client.market_by_slug(&market_request).await?;
-    let token_ids: Vec<String> = if let Some(clob_tokens) = &market.clob_token_ids {
-        clob_tokens.iter().map(|t| t.to_string()).collect()
-    } else {
-        vec![]
-    };
-    {
-        let mut tokens = TOKEN_IDS_CACHE.lock().unwrap();
-        tokens.clear();
-        tokens.insert(slug.to_string(), token_ids.clone());
-    }
-    Ok(token_ids)
-}
-*/
-pub async fn get_or_fetch_token_ids(
-    client: &GammaClient,
-    slug: &str,
-) -> anyhow::Result<Vec<String>> {
-    // This internally checks MARKET_BY_SLUG_CACHE first
-    let market = get_or_fetch_market_by_slug(client, slug).await?;
-
-    let token_ids: Vec<String> = market
-        .clob_token_ids
-        .as_ref()
-        .map(|tokens| {
-            tokens
-                .iter()
-                .map(|t| t.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(token_ids)
-}
-
-pub fn get_or_fetch_api_creds(
+pub async fn get_or_fetch_api_creds(
     private_key: String,
     host: String,
-) -> impl std::future::Future<Output = anyhow::Result<Credentials>> {
-    async move {
-        let cache_key = format!("{}@{}", private_key, host);
-        {
-            let cache = API_CREDS_CACHE.lock().unwrap();
-            if let Some(creds) = cache.get(&cache_key) {
-                return Ok(creds.clone());
-            }
+) -> anyhow::Result<Credentials> {
+    let key = format!("{private_key}@{host}");
+    {
+        let cache = CREDS_CACHE.lock().unwrap();
+        if let Some(c) = cache.get(&key) {
+            return Ok(c.clone());
         }
-        let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
-        let client = ClobClient::new(&host, Config::default())?;
-        let creds: Credentials = client.create_or_derive_api_key(&signer, None).await?;
-        {
-            let mut cache = API_CREDS_CACHE.lock().unwrap();
-            cache.insert(cache_key, creds.clone());
-        }
-        Ok(creds)
     }
+
+    let signer = LocalSigner::from_str(&private_key)?
+        .with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
+    let client = ClobClient::new(&host, Config::default())?;
+    let creds: Credentials = client.create_or_derive_api_key(&signer, None).await?;
+
+    {
+        let mut cache = CREDS_CACHE.lock().unwrap();
+        cache.insert(key, creds.clone());
+    }
+    Ok(creds)
 }
 
 async fn place_order_limit(
-    clob_client: Arc<Mutex<Option<ClobClient<Authenticated<Normal>>>>>,
-    payload: &OrderLimitRequest,
-    target_slug: &str,
+    client: SharedClient,
+    payload: &LimitRequest,
+    slug: &str,
 ) -> anyhow::Result<PostOrderResponse> {
-    let total_timer = Timer::start("place_order_limit_total");
+    let _t = Timer::start("place_limit_total");
 
-    // Load signer
     let private_key = std::env::var("PRIVATE_KEY_VAR")?;
     let signer = LocalSigner::from_str(&private_key)?
         .with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
 
-    // Fetch token IDs
-    let gamma_client = GammaClient::default();
-    let token_ids = get_or_fetch_token_ids(&gamma_client, target_slug).await?;
-    if token_ids.len() < 2 {
-        anyhow::bail!("No token IDs available for slug {}", target_slug);
-    }
+    let gamma = GammaClient::default();
+    let ids = get_or_fetch_token_ids(&gamma, slug).await?;
+    anyhow::ensure!(ids.len() >= 2, "no token IDs for slug {slug}");
 
-    // Determine token ID using case-insensitive match
     let token_id = if payload.token.eq_ignore_ascii_case("up") {
-        U256::from_str(&token_ids[0])?
+        U256::from_str(&ids[0])?
     } else if payload.token.eq_ignore_ascii_case("down") {
-        U256::from_str(&token_ids[1])?
+        U256::from_str(&ids[1])?
     } else {
-        anyhow::bail!("Invalid token: {}. Must be 'up' or 'down'", payload.token);
+        anyhow::bail!("invalid token '{}'; must be 'up' or 'down'", payload.token);
     };
 
-    // Parse price and size
     let price = Decimal::from_str(&payload.price)?;
     let size = Decimal::from_str(&payload.size)?;
+    let side = parse_side(&payload.side)?;
 
-    // Determine side using case-insensitive match
-    let side = if payload.side.eq_ignore_ascii_case("buy") {
-        Side::Buy
-    } else if payload.side.eq_ignore_ascii_case("sell") {
-        Side::Sell
-    } else {
-        anyhow::bail!("Invalid side: {}", payload.side);
-    };
+    let mut guard = client.lock().await;
+    let c = guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialised"))?;
+    c.set_tick_size(token_id, TickSize::Hundredth);
 
-    // Acquire CLOB client
-    let mut client_guard = clob_client.lock().await;
-    let client = client_guard
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("CLOB client not initialized"))?;
-
-    // Configure tick size
-    client.set_tick_size(token_id, TickSize::Hundredth);
-
-    // Build order
-    let order = client
-        .limit_order()
-        .token_id(token_id)
-        .size(size)
-        .price(price)
-        .side(side)
-        .build()
-        .await?;
-
-    // Sign and post order
-    let signed_order = timed!("sign order", { client.sign(&signer, order).await? });
-    let response = timed!("post order", { client.post_order(signed_order).await? });
-
-    total_timer.done();
-    Ok(response)
+    let order = c.limit_order().token_id(token_id).size(size).price(price).side(side).build().await?;
+    let signed = timed!("sign_limit", { c.sign(&signer, order).await? });
+    let resp = timed!("post_limit", { c.post_order(signed).await? });
+    Ok(resp)
 }
 
 async fn place_order_market(
-    clob_client: Arc<Mutex<Option<ClobClient<Authenticated<Normal>>>>>,
-    payload: &OrderMarketRequest, 
-    target_slug: &str
+    client: SharedClient,
+    payload: &MarketRequest,
+    slug: &str,
 ) -> anyhow::Result<PostOrderResponse> {
     let private_key = std::env::var("PRIVATE_KEY_VAR")?;
-    let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
+    let signer = LocalSigner::from_str(&private_key)?
+        .with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
 
-    let gamma_client = GammaClient::default();
-    let token_ids = get_or_fetch_token_ids(&gamma_client, target_slug).await?;
-    if token_ids.len() < 2 { anyhow::bail!("No token IDs available for slug {}", target_slug); }
+    let gamma = GammaClient::default();
+    let ids = get_or_fetch_token_ids(&gamma, slug).await?;
+    anyhow::ensure!(ids.len() >= 2, "no token IDs for slug {slug}");
 
     let token_id = match payload.token.to_lowercase().as_str() {
-        "up" => U256::from_str(&token_ids[0])?,
-        "down" => U256::from_str(&token_ids[1])?,
-        _ => anyhow::bail!("Invalid token"),
+        "up" => U256::from_str(&ids[0])?,
+        "down" => U256::from_str(&ids[1])?,
+        _ => anyhow::bail!("invalid token '{}'", payload.token),
     };
-    let side = match payload.side.to_lowercase().as_str() {
-        "buy" => Side::Buy,
-        "sell" => Side::Sell,
-        _ => anyhow::bail!("Invalid side"),
-    };
+    let side = parse_side(&payload.side)?;
     let order_type = match payload.order_type.as_deref() {
         Some("FAK") => OrderType::FAK,
         _ => OrderType::FOK,
     };
 
-    let mut client_guard = clob_client.lock().await;
-    let client = client_guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialized"))?;
+    let mut guard = client.lock().await;
+    let c = guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialised"))?;
+    c.set_tick_size(token_id, TickSize::Hundredth);
 
-    client.set_tick_size(token_id, TickSize::Hundredth);
-
-    let mut order_builder = client.market_order().token_id(token_id).side(side).order_type(order_type);
-    if let Some(usdc) = &payload.usdc {
-        order_builder = order_builder.amount(Amount::usdc(Decimal::from_str(usdc)?)?);
-    } else if let Some(shares) = &payload.shares {
-        order_builder = order_builder.amount(Amount::shares(Decimal::from_str(shares)?)?);
+    let mut builder = c.market_order().token_id(token_id).side(side).order_type(order_type);
+    if let Some(u) = &payload.usdc {
+        builder = builder.amount(Amount::usdc(Decimal::from_str(u)?)?);
+    } else if let Some(s) = &payload.shares {
+        builder = builder.amount(Amount::shares(Decimal::from_str(s)?)?);
     } else {
-        anyhow::bail!("Missing usdc or shares context");
+        anyhow::bail!("market order requires usdc or shares");
     }
 
-    let order = order_builder.build().await?;
-    let signed_order = client.sign(&signer, order).await?;
-    let response = client.post_order(signed_order).await?;
-
-    Ok(response)
+    let order = builder.build().await?;
+    let signed = c.sign(&signer, order).await?;
+    let resp = c.post_order(signed).await?;
+    Ok(resp)
 }
 
 async fn get_order_status(
-    clob_client: Arc<Mutex<Option<ClobClient<Authenticated<Normal>>>>>,
-    order_id: &str
+    client: SharedClient,
+    order_id: &str,
 ) -> anyhow::Result<OpenOrderResponse> {
-    let mut client_guard = clob_client.lock().await;
-    let client = client_guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialized"))?;
-
-    let order_response = client.order(order_id).await?;
-
-    Ok(order_response)
+    let mut guard = client.lock().await;
+    let c = guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialised"))?;
+    Ok(c.order(order_id).await?)
 }
 
 async fn cancel_order(
-    clob_client: Arc<Mutex<Option<ClobClient<Authenticated<Normal>>>>>,
-    order_id: &str
+    client: SharedClient,
+    order_id: &str,
 ) -> anyhow::Result<CancelOrdersResponse> {
-    let mut client_guard = clob_client.lock().await;
-    let client = client_guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialized"))?;
-
-    let resp = client.cancel_order(order_id).await?;
-
-    Ok(resp)
+    let mut guard = client.lock().await;
+    let c = guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialised"))?;
+    Ok(c.cancel_order(order_id).await?)
 }
 
-async fn cancel_all_orders(
-    clob_client: Arc<Mutex<Option<ClobClient<Authenticated<Normal>>>>>,
-) -> anyhow::Result<CancelOrdersResponse> {
-    let mut client_guard = clob_client.lock().await;
-    let client = client_guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialized"))?;
+async fn cancel_all_orders(client: SharedClient) -> anyhow::Result<CancelOrdersResponse> {
+    let mut guard = client.lock().await;
+    let c = guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialised"))?;
+    Ok(c.cancel_all_orders().await?)
+}
 
-    let resp = client.cancel_all_orders().await?;
-
-    Ok(resp)
+fn parse_side(s: &str) -> anyhow::Result<Side> {
+    match s.to_lowercase().as_str() {
+        "buy" => Ok(Side::Buy),
+        "sell" => Ok(Side::Sell),
+        _ => anyhow::bail!("invalid side '{s}'"),
+    }
 }

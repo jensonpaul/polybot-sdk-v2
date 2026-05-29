@@ -1,51 +1,49 @@
-pub mod theme;
+//! # UI Application
+//!
+//! `PolymarketDashboardApp` is the `eframe::App` implementation.
+//!
+//! ## Repaint strategy
+//!
+//! The worker calls `ctx.request_repaint()` after every state mutation.
+//! The UI falls back to `ctx.request_repaint_after(250 ms)` when idle so the
+//! countdown timer stays live without burning CPU.  The old 33 ms unconditional
+//! loop is gone.
+//!
+//! ## UI state vs shared state
+//!
+//! `PolymarketDashboardApp` owns:
+//! - Form field strings (ephemeral user input)
+//! - `Vec<WindowGroup>` — display-only; order IDs reference `AppState`
+//! - `Vec<ToastNotification>` — ephemeral notifications
+//!
+//! The live order/trade/price data lives in `AppState` (shared with worker).
+
 pub mod auth_gateway;
-pub mod order_forms;
-pub mod window_matrix;
 pub mod check_interval;
+pub mod order_forms;
+pub mod theme;
 pub mod widgets;
+pub mod window_matrix;
 
-use crate::ui::auth_gateway::*;
-use crate::ui::order_forms::*;
-use crate::ui::theme::*;
-use crate::ui::window_matrix::*;
-
-use crate::worker::{
-    build_slug_for_timestamp,
-    initiate_stamp_5m,
-};
-
-use crate::worker_config::{
-    Queue,
-    SharedPollConfig,
-};
-
-use crate::ui_types::{
-    NotificationKind,
-    ToastNotification,
-    UiCommand,
-    WindowGroup,
-    WorkerUpdate,
-};
+use std::collections::HashSet;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromStr;
 use rust_decimal::RoundingStrategy;
+use tokio::sync::mpsc::{Receiver, Sender};
 
-use std::collections::HashSet;
-use std::time::{
-    Duration,
-    Instant,
-    SystemTime,
-    UNIX_EPOCH,
+use crate::messages::{UiCommand, WorkerEvent};
+use crate::state::{
+    NotificationKind, SharedAppState, ToastNotification, WindowGroup, slug_for_ts, stamp_5m,
 };
+use crate::ui::theme::{Theme, apply_dashboard_theme};
+use crate::worker_config::{Queue, SharedPollConfig};
 
-use tokio::sync::mpsc::{
-    Receiver,
-    Sender,
-};
+// ---------------------------------------------------------------------------
+// Interval input helpers
+// ---------------------------------------------------------------------------
 
 pub struct IntervalInputs {
     pub orders: String,
@@ -54,12 +52,7 @@ pub struct IntervalInputs {
 }
 
 impl IntervalInputs {
-
-    pub fn get_mut(
-        &mut self,
-        queue: Queue,
-    ) -> &mut String {
-
+    pub fn get_mut(&mut self, queue: Queue) -> &mut String {
         match queue {
             Queue::Orders => &mut self.orders,
             Queue::Trades => &mut self.trades,
@@ -67,11 +60,7 @@ impl IntervalInputs {
         }
     }
 
-    pub fn get(
-        &self,
-        queue: Queue,
-    ) -> &str {
-
+    pub fn get(&self, queue: Queue) -> &str {
         match queue {
             Queue::Orders => &self.orders,
             Queue::Trades => &self.trades,
@@ -80,566 +69,291 @@ impl IntervalInputs {
     }
 }
 
+// ---------------------------------------------------------------------------
+// App struct
+// ---------------------------------------------------------------------------
+
 pub struct PolymarketDashboardApp {
+    // ── shared state (single source of truth) ──────────────────────────────
+    pub state: SharedAppState,
 
-    // =====================================================
-    // AUTH
-    // =====================================================
+    // ── channels ───────────────────────────────────────────────────────────
+    pub cmd_tx: Sender<UiCommand>,
+    pub event_rx: Receiver<WorkerEvent>,
 
+    // ── auth ───────────────────────────────────────────────────────────────
     pub bearer_token: String,
     pub is_authenticated: bool,
 
-    // =====================================================
-    // SYSTEM
-    // =====================================================
-
-    pub auto_refresh_active: bool,
-
-    pub interval_inputs: IntervalInputs,
-
-    pub poll_config: SharedPollConfig,
-
-    pub active_feed_window: Option<u64>,
-
-    pub feed_started_for: HashSet<u64>,
-
-    // =====================================================
-    // LIMIT ORDER
-    // =====================================================
-
-    pub limit_side_buy: bool,
-
-    pub limit_token_up: bool,
-
-    pub limit_price: String,
-
-    pub limit_size: String,
-
-    pub limit_rapid_price: String,
-
-    // =====================================================
-    // MARKET ORDER
-    // =====================================================
-
-    pub market_side_buy: bool,
-
-    pub market_token_up: bool,
-
-    pub market_usdc: String,
-
-    pub market_shares: String,
-
-    pub market_use_usdc: bool,
-
-    pub market_type_fok: bool,
-
-    // =====================================================
-    // STATE
-    // =====================================================
-
+    // ── display windows (keys into AppState) ───────────────────────────────
     pub windows: Vec<WindowGroup>,
 
+    /// Windows for which we have already sent `StartMarketFeed`.
+    pub feed_started_for: HashSet<u64>,
+
+    // ── transient UI state ─────────────────────────────────────────────────
     pub notifications: Vec<ToastNotification>,
+    pub auto_refresh_active: bool,
+    pub poll_config: SharedPollConfig,
+    pub interval_inputs: IntervalInputs,
 
-    // =====================================================
-    // CHANNELS
-    // =====================================================
+    // ── limit order form ───────────────────────────────────────────────────
+    pub limit_side_buy: bool,
+    pub limit_token_up: bool,
+    pub limit_price: String,
+    pub limit_size: String,
+    pub limit_rapid_price: String,
 
-    pub cmd_tx: Sender<UiCommand>,
-
-    pub update_rx: Receiver<WorkerUpdate>,
+    // ── market order form ──────────────────────────────────────────────────
+    pub market_side_buy: bool,
+    pub market_token_up: bool,
+    pub market_usdc: String,
+    pub market_shares: String,
+    pub market_use_usdc: bool,
+    pub market_type_fok: bool,
 }
 
 impl PolymarketDashboardApp {
-
     pub fn new(
         _cc: &eframe::CreationContext<'_>,
         cmd_tx: Sender<UiCommand>,
-        update_rx: Receiver<WorkerUpdate>,
+        event_rx: Receiver<WorkerEvent>,
+        state: SharedAppState,
         poll_config: SharedPollConfig,
     ) -> Self {
-
-        let expected_token =
-            std::env::var("API_BEARER_TOKEN")
-                .unwrap_or_default();
+        let bearer_token = std::env::var("API_BEARER_TOKEN").unwrap_or_default();
 
         Self {
-
-            bearer_token: expected_token,
-
-            is_authenticated: false,
-
-            auto_refresh_active: true,
-
-            interval_inputs: IntervalInputs {
-
-                orders:
-                    poll_config
-                        .get(Queue::Orders)
-                        .to_string(),
-
-                trades:
-                    poll_config
-                        .get(Queue::Trades)
-                        .to_string(),
-
-                rapid_sell:
-                    poll_config
-                        .get(Queue::RapidSell)
-                        .to_string(),
-            },
-
-            poll_config,
-
-            active_feed_window: None,
-
-            feed_started_for:
-                HashSet::new(),
-
-            // LIMIT
-
-            limit_side_buy: true,
-
-            limit_token_up: true,
-
-            limit_price: "0.50".into(),
-
-            limit_size: "10".into(),
-
-            limit_rapid_price: "0.00".into(),
-
-            // MARKET
-
-            market_side_buy: true,
-
-            market_token_up: true,
-
-            market_usdc: "5.00".into(),
-
-            market_shares: "0".into(),
-
-            market_use_usdc: true,
-
-            market_type_fok: true,
-
-            windows: Vec::new(),
-
-            notifications: Vec::new(),
-
+            state,
             cmd_tx,
-
-            update_rx,
+            event_rx,
+            bearer_token,
+            is_authenticated: false,
+            windows: Vec::new(),
+            feed_started_for: HashSet::new(),
+            notifications: Vec::new(),
+            auto_refresh_active: true,
+            interval_inputs: IntervalInputs {
+                orders: poll_config.get(Queue::Orders).to_string(),
+                trades: poll_config.get(Queue::Trades).to_string(),
+                rapid_sell: poll_config.get(Queue::RapidSell).to_string(),
+            },
+            poll_config,
+            limit_side_buy: true,
+            limit_token_up: true,
+            limit_price: "0.50".into(),
+            limit_size: "10".into(),
+            limit_rapid_price: "0.00".into(),
+            market_side_buy: true,
+            market_token_up: true,
+            market_usdc: "5.00".into(),
+            market_shares: "0".into(),
+            market_use_usdc: true,
+            market_type_fok: true,
         }
     }
 
-    pub fn push_toast(
-        &mut self,
-        msg: String,
-        kind: NotificationKind,
-    ) {
+    pub fn push_toast(&mut self, msg: String, kind: NotificationKind) {
+        let secs = if matches!(kind, NotificationKind::Error) { 8 } else { 4 };
+        self.notifications.push(ToastNotification {
+            message: msg,
+            kind,
+            expires_at: Instant::now() + Duration::from_secs(secs),
+        });
+    }
 
-        let duration = match kind {
+    /// Ensure a `WindowGroup` entry exists for `ts`.  Returns `true` if a new
+    /// window was just inserted (caller may want to start its feed).
+    fn ensure_window(&mut self, ts: u64) -> bool {
+        if !self.windows.iter().any(|w| w.timestamp_5m == ts) {
+            self.windows.insert(
+                0,
+                WindowGroup {
+                    timestamp_5m: ts,
+                    slug: slug_for_ts(ts),
+                    is_expanded: true,
+                    order_ids: Vec::new(),
+                    market_prices: None,
+                },
+            );
+            true
+        } else {
+            false
+        }
+    }
 
-            NotificationKind::Error => 8,
+    /// Synchronise `WindowGroup::order_ids` from `AppState::orders`.
+    ///
+    /// Called once per frame.  Cost is O(orders) which is always small for a
+    /// trading terminal (dozens, not millions).
+    fn sync_window_order_ids(&mut self) {
+        // First, clear all ID lists.
+        for w in &mut self.windows {
+            w.order_ids.clear();
+        }
 
-            _ => 4,
-        };
-
-        self.notifications.push(
-            ToastNotification {
-
-                message: msg,
-
-                kind,
-
-                expires_at:
-                    Instant::now()
-                        + Duration::from_secs(duration),
+        // Then repopulate from the source of truth.
+        for entry in self.state.orders.iter() {
+            let order = entry.value();
+            if let Some(w) = self
+                .windows
+                .iter_mut()
+                .find(|w| w.timestamp_5m == order.window_ts)
+            {
+                if !w.order_ids.contains(&order.id) {
+                    w.order_ids.push(order.id.clone());
+                }
+            } else {
+                // Order belongs to a window that hasn't been created yet
+                // (e.g. restored from a previous session).  Create it.
+                self.windows.push(WindowGroup {
+                    timestamp_5m: order.window_ts,
+                    slug: slug_for_ts(order.window_ts),
+                    is_expanded: true,
+                    order_ids: vec![order.id.clone()],
+                    market_prices: None,
+                });
             }
-        );
+        }
     }
 }
 
+// ---------------------------------------------------------------------------
+// eframe::App
+// ---------------------------------------------------------------------------
+
 impl eframe::App for PolymarketDashboardApp {
-
-    fn update(
-        &mut self,
-        ctx: &egui::Context,
-        _frame: &mut eframe::Frame,
-    ) {
-
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_dashboard_theme(ctx);
 
-        // =====================================================
-        // WORKER EVENTS
-        // =====================================================
-
-        while let Ok(update) =
-            self.update_rx.try_recv()
-        {
-            match update {
-
-                WorkerUpdate::OrderAdded {
-                    window_ts,
-                    order,
-                } => {
-
-                    if let Some(w) =
-                        self.windows
-                            .iter_mut()
-                            .find(|w|
-                                w.timestamp_5m == window_ts
-                            )
-                    {
-                        w.orders.push(order);
-
-                    } else {
-
-                        self.windows.push(
-                            WindowGroup {
-
-                                timestamp_5m:
-                                    window_ts,
-
-                                slug:
-                                    build_slug_for_timestamp(
-                                        window_ts
-                                    ),
-
-                                is_expanded: true,
-
-                                orders: vec![order],
-
-                                market_prices: None,
-
-                                market_feed: None,
-                            }
-                        );
-                    }
+        // ------------------------------------------------------------------
+        // Drain worker events (notifications; feed-started signals)
+        // ------------------------------------------------------------------
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                WorkerEvent::Notify { message, kind } => {
+                    self.push_toast(message, kind);
                 }
-
-                WorkerUpdate::OrderUpdated {
-                    window_ts,
-                    order_id,
-                    status,
-                    matched,
-                    open_order_response,
-                } => {
-
-                    if let Some(w) =
-                        self.windows
-                            .iter_mut()
-                            .find(|w|
-                                w.timestamp_5m == window_ts
-                            )
-                    {
-                        if let Some(o) =
-                            w.orders
-                                .iter_mut()
-                                .find(|o|
-                                    o.id == order_id
-                                )
-                        {
-                            o.status = status;
-
-                            /*
-                            o.size_matched =
-                                matched.clone();
-
-                            o.inline_sell_size =
-                                round_to_two_dp(
-                                    &matched
-                                );
-
-                            o.executed_size = 
-                                Some(matched.clone());
-                                */
-
-                            let matched_val: f64 = matched.parse().unwrap_or(0.0);
-
-                            if matched_val > 0.0 {
-                                o.executed_size = Some(matched.clone());
-                                o.size_matched = matched.clone();
-                                o.inline_sell_size = round_to_two_dp(&matched);
-                            } else {
-                                // explicitly keep it None for "no fill"
-                                o.executed_size = None;
-                            }
-
-                            if let Some(order_response) = open_order_response {
-                                o.executed_price = Some(
-                                    round_to_two_dp(
-                                        &order_response.price.to_string()
-                                    )
-                                );
-
-                                o.open_order_response = Some(order_response);
-                            }
-                        }
-                    }
-                }
-
-                WorkerUpdate::Notify {
-                    message,
-                    kind,
-                } => {
-
-                    self.push_toast(
-                        message,
-                        kind,
-                    );
-                }
-
-                WorkerUpdate::MarketFeedStarted {
-                    window_ts,
-                    prices,
-                } => {
-
-                    if let Some(window) =
-                        self.windows
-                            .iter_mut()
-                            .find(|w|
-                                w.timestamp_5m == window_ts
-                            )
-                    {
-                        window.market_prices =
-                            Some(prices);
-                    }
+                WorkerEvent::MarketFeedStarted { window_ts } => {
+                    // The prices ArcSwap is already in AppState::market_prices.
+                    // Nothing extra needed here; the window_matrix reads it directly.
+                    tracing::debug!(window_ts, "market feed ready signal received");
                 }
             }
         }
 
-        self.notifications.retain(
-            |n|
-                Instant::now()
-                    < n.expires_at
-        );
+        // Expire toasts.
+        self.notifications.retain(|n| Instant::now() < n.expires_at);
 
-        // =====================================================
-        // AUTH
-        // =====================================================
-
+        // ------------------------------------------------------------------
+        // Auth gate
+        // ------------------------------------------------------------------
         if !self.is_authenticated {
-
             self.render_auth_gateway(ctx);
-
             return;
         }
 
-        // =====================================================
-        // WINDOW STATE
-        // =====================================================
+        // ------------------------------------------------------------------
+        // Window management
+        // ------------------------------------------------------------------
+        let current_ts = stamp_5m();
 
-        let current_ts =
-            initiate_stamp_5m();
+        self.ensure_window(current_ts);
 
-        let slug =
-            build_slug_for_timestamp(
-                current_ts
-            );
+        // Keep window order-ID lists in sync with shared state.
+        self.sync_window_order_ids();
 
-        let current_time_raw =
-            SystemTime::now()
-                .duration_since(
-                    UNIX_EPOCH
-                )
-                .unwrap()
-                .as_secs();
-
-        let time_remaining =
-            300 - (current_time_raw % 300);
-
-        // =====================================================
-        // ENSURE ACTIVE WINDOW
-        // =====================================================
-
-        if !self.windows
-            .iter()
-            .any(|w|
-                w.timestamp_5m == current_ts
-            )
-        {
-            self.windows.insert(
-                0,
-
-                WindowGroup {
-
-                    timestamp_5m:
-                        current_ts,
-
-                    slug,
-
-                    is_expanded: true,
-
-                    orders: Vec::new(),
-
-                    market_prices: None,
-
-                    market_feed: None,
-                }
-            );
+        // Start the market feed for the current window if not already started.
+        if self.feed_started_for.insert(current_ts) {
+            let _ = self.cmd_tx.try_send(UiCommand::StartMarketFeed {
+                window_ts: current_ts,
+                slug: slug_for_ts(current_ts),
+            });
         }
 
-        // =====================================================
-        // FEED INIT
-        // =====================================================
+        // ------------------------------------------------------------------
+        // Compute countdown for top bar
+        // ------------------------------------------------------------------
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let time_remaining = 300 - (now_secs % 300);
 
-        if self.feed_started_for
-            .insert(current_ts)
-        {
-            let _ =
-                self.cmd_tx.try_send(
-                    UiCommand::StartMarketFeed {
-
-                        window_ts:
-                            current_ts,
-
-                        slug:
-                            build_slug_for_timestamp(
-                                current_ts
-                            ),
-                    }
-                );
-        }
-
-        // =====================================================
-        // TOP BAR
-        // =====================================================
-
+        // ------------------------------------------------------------------
+        // Top bar
+        // ------------------------------------------------------------------
         egui::TopBottomPanel::top("top_bar")
             .exact_height(42.0)
             .show(ctx, |ui| {
-
                 ui.horizontal(|ui| {
-
                     ui.heading(
-
-                        egui::RichText::new(
-                            "Polymarket Trading Terminal"
-                        )
-                        .color(
-                            Theme::TEXT_PRIMARY
-                        )
+                        egui::RichText::new("Polymarket Trading Terminal")
+                            .color(Theme::TEXT_PRIMARY),
                     );
 
                     ui.with_layout(
-
-                        egui::Layout::right_to_left(
-                            egui::Align::Center
-                        ),
-
+                        egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-
                             ui.label(
-
-                                egui::RichText::new(
-
-                                    format!(
-                                        "RESET {:02}:{:02}",
-                                        time_remaining / 60,
-                                        time_remaining % 60,
-                                    )
-                                )
+                                egui::RichText::new(format!(
+                                    "RESET {:02}:{:02}",
+                                    time_remaining / 60,
+                                    time_remaining % 60
+                                ))
                                 .monospace()
-                                .color(
-                                    Theme::WARNING
-                                )
+                                .color(Theme::WARNING),
                             );
-                        }
+                        },
                     );
                 });
             });
 
-        // =====================================================
-        // TOASTS
-        // =====================================================
-
+        // ------------------------------------------------------------------
+        // Toast notifications overlay
+        // ------------------------------------------------------------------
         if !self.notifications.is_empty() {
-
-            egui::Window::new(
-                "Notifications"
-            )
-            .anchor(
-                egui::Align2::RIGHT_TOP,
-                [-12.0, 50.0],
-            )
-            .resizable(false)
-            .collapsible(false)
-            .show(ctx, |ui| {
-
-                for toast in &self.notifications {
-
-                    let color =
-                        match toast.kind {
-
-                            NotificationKind::Success =>
-                                Theme::BUY_GREEN,
-
-                            NotificationKind::Error =>
-                                Theme::SELL_RED,
-
-                            NotificationKind::Warning =>
-                                Theme::WARNING,
-
-                            _ =>
-                                Theme::BLUE,
+            egui::Window::new("Notifications")
+                .anchor(egui::Align2::RIGHT_TOP, [-12.0, 50.0])
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    for toast in &self.notifications {
+                        let color = match toast.kind {
+                            NotificationKind::Success => Theme::BUY_GREEN,
+                            NotificationKind::Error => Theme::SELL_RED,
+                            NotificationKind::Warning => Theme::WARNING,
+                            _ => Theme::BLUE,
                         };
-
-                    ui.colored_label(
-                        color,
-                        &toast.message,
-                    );
-                }
-            });
+                        ui.colored_label(color, &toast.message);
+                    }
+                });
         }
 
-        // =====================================================
-        // MAIN PANEL
-        // =====================================================
+        // ------------------------------------------------------------------
+        // Main panel
+        // ------------------------------------------------------------------
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.render_order_consoles(ui, current_ts);
+            ui.add_space(12.0);
+            self.render_lifecycle_matrix(ui);
+        });
 
-        egui::CentralPanel::default()
-            .show(ctx, |ui| {
-
-                self.render_order_consoles(
-                    ui,
-                    current_ts,
-                );
-
-                ui.add_space(12.0);
-
-                self.render_lifecycle_matrix(ui);
-            });
-
-        // =====================================================
-        // REFRESH
-        // =====================================================
-
+        // ------------------------------------------------------------------
+        // Repaint strategy: event-driven (worker) + 4 FPS idle fallback
+        // ------------------------------------------------------------------
         if self.auto_refresh_active {
-
-            ctx.request_repaint_after(
-                Duration::from_millis(33)
-            );
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
 }
 
-fn round_to_two_dp(
-    value: &str,
-) -> String {
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
 
+pub fn round_to_two_dp(value: &str) -> String {
     Decimal::from_str(value)
-
-        .map(|d|
-
-            d.round_dp_with_strategy(
-                2,
-                RoundingStrategy::ToZero
-            )
-            .to_string()
-        )
-
-        .unwrap_or_else(
-            |_|
-                value.to_string()
-        )
+        .map(|d| d.round_dp_with_strategy(2, RoundingStrategy::ToZero).to_string())
+        .unwrap_or_else(|_| value.to_owned())
 }
