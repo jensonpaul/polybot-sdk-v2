@@ -435,6 +435,12 @@ impl PolymarketWorker {
                     state.market_prices.remove(&window_ts);
 
                     // ---------------------------------------------------------
+                    // Remove from orders polling
+                    // ---------------------------------------------------------
+                    let poll_list = Arc::clone(&orders_to_poll);
+                    poll_list.lock().await.retain(|(ts, _)| *ts != window_ts);
+
+                    // ---------------------------------------------------------
                     // Remove orders + associated trades
                     // ---------------------------------------------------------
                     let order_ids: Vec<String> = state
