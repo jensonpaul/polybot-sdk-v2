@@ -322,7 +322,10 @@ impl PolymarketDashboardApp {
                 // Inline exit desk (only for filled buys)
                 if matches!(
                     order.status,
-                    LocalOrderStatus::FullyFilled | LocalOrderStatus::PartiallyFilled { .. }
+                    LocalOrderStatus::TradeConfirmed 
+                    | LocalOrderStatus::TradeOpen 
+                    | LocalOrderStatus::FullyFilled 
+                    | LocalOrderStatus::PartiallyFilled { .. }
                 ) && order.side.eq_ignore_ascii_case("buy")
                 {
                     ui.add_space(8.0);
