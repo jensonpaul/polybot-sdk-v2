@@ -88,7 +88,7 @@ lazy_static! {
 // ---------------------------------------------------------------------------
 
 type AuthenticatedClient = ClobClient<Authenticated<Normal>>;
-type SharedClient = Arc<Mutex<Option<AuthenticatedClient>>>;
+type SharedClient = AuthenticatedClient;
 
 pub struct PolymarketWorker {
     pub cmd_rx: Receiver<UiCommand>,
@@ -125,10 +125,7 @@ impl PolymarketWorker {
     pub async fn run(mut self) -> anyhow::Result<()> {
         info!("PolymarketWorker: starting");
 
-        let client: SharedClient = {
-            let c = self.init_client().await?;
-            Arc::new(Mutex::new(Some(c)))
-        };
+        let client = self.init_client().await?;
 
         // ------------------------------------------------------------------
         // Shared helpers passed into spawned tasks
@@ -136,17 +133,11 @@ impl PolymarketWorker {
         let state = self.state.clone();
         let ctx = self.ctx.clone();
 
-        // `orders_to_poll`: the set of (window_ts, order_id) pairs currently
-        // being watched by the polling loop.
-        let orders_to_poll: Arc<Mutex<Vec<(u64, String)>>> =
-            Arc::new(Mutex::new(Vec::new()));
-
         // ------------------------------------------------------------------
         // Task A: Orders polling loop
         // ------------------------------------------------------------------
         spawn_orders_polling_loop(
-            Arc::clone(&client),
-            Arc::clone(&orders_to_poll),
+            client.clone(),
             Arc::clone(&state),
             ctx.clone(),
             self.poll_config.atomic(Queue::Orders),
@@ -157,7 +148,7 @@ impl PolymarketWorker {
         // Task B: Trades polling loop
         // ------------------------------------------------------------------
         spawn_trades_polling_loop(
-            Arc::clone(&client),
+            client.clone(),
             Arc::clone(&state),
             ctx.clone(),
             self.poll_config.atomic(Queue::Trades),
@@ -167,8 +158,7 @@ impl PolymarketWorker {
         // Task C: Rapid-sell automation loop
         // ------------------------------------------------------------------
         spawn_rapid_sell_loop(
-            Arc::clone(&client),
-            Arc::clone(&orders_to_poll),
+            client.clone(),
             Arc::clone(&state),
             ctx.clone(),
             self.poll_config.atomic(Queue::RapidSell),
@@ -194,10 +184,9 @@ impl PolymarketWorker {
                 }
 
                 UiCommand::PlaceLimit { side, token, price, size, rapid_price, window_ts } => {
-                    let client = Arc::clone(&client);
+                    let client = client.clone();
                     let state = Arc::clone(&state);
                     let ctx = ctx.clone();
-                    let poll_list = Arc::clone(&orders_to_poll);
                     let event_tx = self.event_tx.clone();
 
                     tokio::spawn(async move {
@@ -209,7 +198,7 @@ impl PolymarketWorker {
                             size: size.clone(),
                         };
 
-                        match place_order_limit(Arc::clone(&client), &req, &slug).await {
+                        match place_order_limit(client.clone(), &req, &slug).await {
                             Ok(resp) => match parse_response(resp) {
                                 Ok(order_id) => {
                                     let order = TrackedOrder {
@@ -240,7 +229,6 @@ impl PolymarketWorker {
                                     };
 
                                     state.orders.insert(order_id.clone(), order);
-                                    poll_list.lock().await.push((window_ts, order_id));
                                     state.touch();
                                     ctx.request_repaint();
 
@@ -259,10 +247,9 @@ impl PolymarketWorker {
                 }
 
                 UiCommand::PlaceMarket { side, token, usdc, shares, order_type, window_ts } => {
-                    let client = Arc::clone(&client);
+                    let client = client.clone();
                     let state = Arc::clone(&state);
                     let ctx = ctx.clone();
-                    let poll_list = Arc::clone(&orders_to_poll);
                     let event_tx = self.event_tx.clone();
 
                     tokio::spawn(async move {
@@ -275,7 +262,7 @@ impl PolymarketWorker {
                             order_type: order_type.clone(),
                         };
 
-                        match place_order_market(Arc::clone(&client), &req, &slug).await {
+                        match place_order_market(client.clone(), &req, &slug).await {
                             Ok(resp) => match parse_response(resp) {
                                 Ok(order_id) => {
                                     let order = TrackedOrder {
@@ -301,7 +288,6 @@ impl PolymarketWorker {
                                     };
 
                                     state.orders.insert(order_id.clone(), order);
-                                    poll_list.lock().await.push((window_ts, order_id));
                                     state.touch();
                                     ctx.request_repaint();
 
@@ -320,12 +306,12 @@ impl PolymarketWorker {
                 }
 
                 UiCommand::CheckStatus { order_id, window_ts: _ } => {
-                    let client = Arc::clone(&client);
+                    let client = client.clone();
                     let state = Arc::clone(&state);
                     let ctx = ctx.clone();
 
                     tokio::spawn(async move {
-                        if let Ok(info) = get_order_status(Arc::clone(&client), &order_id).await {
+                        if let Ok(info) = get_order_status(client.clone(), &order_id).await {
                             apply_order_status_update(&state, &order_id, &info, false);
                             state.touch();
                             ctx.request_repaint();
@@ -334,20 +320,18 @@ impl PolymarketWorker {
                 }
 
                 UiCommand::CancelIndividual { order_id, window_ts: _ } => {
-                    let client = Arc::clone(&client);
+                    let client = client.clone();
                     let state = Arc::clone(&state);
                     let ctx = ctx.clone();
-                    let poll_list = Arc::clone(&orders_to_poll);
                     let event_tx = self.event_tx.clone();
 
                     tokio::spawn(async move {
-                        match cancel_order(Arc::clone(&client), &order_id).await {
+                        match cancel_order(client.clone(), &order_id).await {
                             Ok(resp) => {
                                 if resp.canceled.contains(&order_id) {
                                     if let Some(mut o) = state.orders.get_mut(&order_id) {
                                         o.status = LocalOrderStatus::Canceled;
                                     }
-                                    poll_list.lock().await.retain(|(_, id)| id != &order_id);
                                     state.touch();
                                     ctx.request_repaint();
                                     notify(&event_tx, "Order cancelled", NotificationKind::Success).await;
@@ -369,22 +353,20 @@ impl PolymarketWorker {
                 }
 
                 UiCommand::CancelAllInWindow { window_ts } => {
-                    let client = Arc::clone(&client);
+                    let client = client.clone();
                     let state = Arc::clone(&state);
                     let ctx = ctx.clone();
-                    let poll_list = Arc::clone(&orders_to_poll);
                     let event_tx = self.event_tx.clone();
 
                     tokio::spawn(async move {
-                        let local_ids: Vec<String> = {
-                            let lock = poll_list.lock().await;
-                            lock.iter()
-                                .filter(|(ts, _)| *ts == window_ts)
-                                .map(|(_, id)| id.clone())
-                                .collect()
-                        };
+                        let local_ids: Vec<String> = state
+                            .orders
+                            .iter()
+                            .filter(|entry| entry.value().window_ts == window_ts)
+                            .map(|entry| entry.key().clone())
+                            .collect();
 
-                        match cancel_all_orders(Arc::clone(&client)).await {
+                        match cancel_all_orders(client.clone()).await {
                             Ok(resp) => {
                                 let count = resp.canceled.len();
                                 for id in &local_ids {
@@ -392,7 +374,6 @@ impl PolymarketWorker {
                                         if let Some(mut o) = state.orders.get_mut(id) {
                                             o.status = LocalOrderStatus::Canceled;
                                         }
-                                        poll_list.lock().await.retain(|(_, oid)| oid != id);
                                     }
                                 }
                                 state.touch();
@@ -440,12 +421,6 @@ impl PolymarketWorker {
                     state.market_prices.remove(&window_ts);
 
                     // ---------------------------------------------------------
-                    // Remove from orders polling
-                    // ---------------------------------------------------------
-                    let poll_list = Arc::clone(&orders_to_poll);
-                    poll_list.lock().await.retain(|(ts, _)| *ts != window_ts);
-
-                    // ---------------------------------------------------------
                     // Remove orders + associated trades
                     // ---------------------------------------------------------
                     let order_ids: Vec<String> = state
@@ -485,7 +460,6 @@ impl PolymarketWorker {
 
 fn spawn_orders_polling_loop(
     client: SharedClient,
-    orders_to_poll: Arc<Mutex<Vec<(u64, String)>>>,
     state: SharedAppState,
     ctx: egui::Context,
     interval_cell: Arc<std::sync::atomic::AtomicU64>,
@@ -510,31 +484,23 @@ fn spawn_orders_polling_loop(
 
             interval.tick().await;
 
-            let snapshot: Vec<(u64, String)> = {
-                let lock = orders_to_poll.lock().await;
-                lock.clone()
-            };
+            let snapshot = state.pollable_orders();
 
             if snapshot.is_empty() {
                 continue;
             }
 
-            let mut to_remove = Vec::new();
-
-            for (window_ts, order_id) in &snapshot {
-                let Ok(info) = get_order_status(Arc::clone(&client), order_id).await else {
+            for order_id in &snapshot {
+                let Ok(info) = get_order_status(client.clone(), order_id).await else {
                     continue;
                 };
 
-                let remove = apply_order_status_update(&state, order_id, &info, true);
-                if remove {
-                    to_remove.push((*window_ts, order_id.clone()));
-                }
-            }
-
-            if !to_remove.is_empty() {
-                let mut lock = orders_to_poll.lock().await;
-                lock.retain(|item| !to_remove.contains(item));
+                apply_order_status_update(
+                    &state,
+                    order_id,
+                    &info,
+                    true,
+                );
             }
 
             if !snapshot.is_empty() {
@@ -549,6 +515,7 @@ fn spawn_orders_polling_loop(
 // Polling task B: trades
 // ---------------------------------------------------------------------------
 
+/*
 fn spawn_trades_polling_loop(
     client: SharedClient,
     state: SharedAppState,
@@ -581,6 +548,14 @@ fn spawn_trades_polling_loop(
             // Deduplicate by window so we make at most one trades call per
             // active market.
             let mut seen_slugs = std::collections::HashSet::new();
+
+            let orders: Vec<_> = state
+                .orders
+                .iter()
+                .map(|e| e.value().window_ts)
+                .collect();
+
+            for window_ts in orders {
 
             for entry in state.orders.iter() {
                 let order = entry.value();
@@ -627,6 +602,71 @@ fn spawn_trades_polling_loop(
         }
     });
 }
+*/
+fn spawn_trades_polling_loop(
+    client: SharedClient,
+    state: SharedAppState,
+    ctx: egui::Context,
+    interval_cell: Arc<std::sync::atomic::AtomicU64>,
+) {
+    tokio::spawn(async move {
+        let mut current_ms = interval_cell.load(Ordering::Relaxed);
+        let mut interval = make_interval(current_ms);
+
+        loop {
+            // Update interval if it has changed
+            let latest = interval_cell.load(Ordering::Relaxed);
+            if latest != current_ms {
+                current_ms = latest;
+                interval = make_interval(current_ms);
+                info!(current_ms, "trades poll interval updated");
+            }
+
+            if current_ms == 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+
+            // Wait for the next tick
+            interval.tick().await;
+
+            // Compute the current 5-minute slug
+            let slug = slug_for_ts(stamp_5m());
+
+            // Get the market condition_id for this slug
+            let condition_id = {
+                let cache = MARKET_CACHE.lock().unwrap();
+                cache.get(&slug).and_then(|m| m.condition_id)
+            };
+
+            let Some(condition_id) = condition_id else {
+                // Market info unavailable, skip this tick
+                continue;
+            };
+
+            // Build the trades request
+            let mut req = TradesRequest::builder().build();
+            req.market = Some(condition_id);
+
+            // Call the client
+            let result = client.trades(&req, None).await;
+
+            // Handle the result
+            match result {
+                Ok(page) => {
+                    for trade in page.data {
+                        state.trades.insert(trade.id.clone(), trade);
+                    }
+                    state.touch();
+                    ctx.request_repaint();
+                }
+                Err(e) => {
+                    tracing::error!(%slug, error=%e, "trades poll failed");
+                }
+            }
+        }
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Polling task C: rapid-sell automation
@@ -634,7 +674,6 @@ fn spawn_trades_polling_loop(
 
 fn spawn_rapid_sell_loop(
     client: SharedClient,
-    orders_to_poll: Arc<Mutex<Vec<(u64, String)>>>,
     state: SharedAppState,
     ctx: egui::Context,
     interval_cell: Arc<std::sync::atomic::AtomicU64>,
@@ -660,6 +699,7 @@ fn spawn_rapid_sell_loop(
             interval.tick().await;
 
             // Collect candidates without holding the DashMap ref across await.
+            /*
             let candidates: Vec<TrackedOrder> = state
                 .orders
                 .iter()
@@ -675,6 +715,52 @@ fn spawn_rapid_sell_loop(
                 })
                 .map(|e| e.value().clone())
                 .collect();
+            */
+            let now = Instant::now();
+
+            let candidates: Vec<TrackedOrder> = state
+                .orders
+                .iter()
+                .filter_map(|entry| {
+                    let order = entry.value();
+
+                    if !order.side.eq_ignore_ascii_case("buy") {
+                        return None;
+                    }
+
+                    if !matches!(order.status, LocalOrderStatus::TradeConfirmed) {
+                        return None;
+                    }
+
+                    if !order.is_trade_fully_confirmed {
+                        return None;
+                    }
+
+                    let matched =
+                        Decimal::from_str(&order.size_matched).unwrap_or_default();
+
+                    let already_sold =
+                        Decimal::from_str(&order.rapid_sell_size).unwrap_or_default();
+
+                    let remaining = (matched - already_sold).max(Decimal::ZERO);
+
+                    if remaining < dec!(5) {
+                        return None;
+                    }
+
+                    match &order.rapid_sell_state {
+                        RapidSellState::Idle => Some(order.clone()),
+
+                        RapidSellState::RetryScheduled { retry_at, .. }
+                            if *retry_at <= now =>
+                        {
+                            Some(order.clone())
+                        }
+
+                        _ => None,
+                    }
+                })
+                .collect();
 
             for order in candidates {
                 let matched = Decimal::from_str(&order.size_matched).unwrap_or_default();
@@ -687,19 +773,62 @@ fn spawn_rapid_sell_loop(
                 }
 
                 // Mark pending immediately to prevent double-fire.
+                /*
                 if let Some(mut o) = state.orders.get_mut(&order.id) {
                     o.rapid_sell_state = RapidSellState::Pending;
                 }
+                */
+                let acquired = {
+                    if let Some(mut o) = state.orders.get_mut(&order.id) {
+                        match o.rapid_sell_state {
+                            RapidSellState::Idle => {
+                                o.rapid_sell_state = RapidSellState::InFlight {
+                                    attempt: 0,
+                                    started_at: Instant::now(),
+                                };
+                                true
+                            }
 
-                let client = Arc::clone(&client);
+                            RapidSellState::RetryScheduled { attempt, retry_at, .. }
+                                if retry_at <= Instant::now() =>
+                            {
+                                o.rapid_sell_state = RapidSellState::InFlight {
+                                    attempt,
+                                    started_at: Instant::now(),
+                                };
+                                true
+                            }
+
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if !acquired {
+                    continue;
+                }
+
+                let client = client.clone();
                 let state = Arc::clone(&state);
                 let ctx = ctx.clone();
-                let poll_list = Arc::clone(&orders_to_poll);
                 let event_tx = event_tx.clone();
                 let parent_id = order.id.clone();
                 let token = order.token.clone();
                 let window_ts = order.window_ts;
                 let rapid_price = order.rapid_sell_price.clone();
+
+                let attempt = {
+                    if let Some(o) = state.orders.get(&order.id) {
+                        match &o.rapid_sell_state {
+                            RapidSellState::InFlight { attempt, .. } => *attempt,
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    }
+                };
 
                 tokio::spawn(async move {
                     let slug = slug_for_ts(stamp_5m());
@@ -710,7 +839,7 @@ fn spawn_rapid_sell_loop(
                         size: sell_amount.to_string(),
                     };
 
-                    match place_order_limit(Arc::clone(&client), &req, &slug).await {
+                    match place_order_limit(client.clone(), &req, &slug).await {
                         Ok(resp) => match parse_response(resp) {
                             Ok(new_id) => {
                                 let sell_order = TrackedOrder {
@@ -736,12 +865,33 @@ fn spawn_rapid_sell_loop(
                                 };
 
                                 state.orders.insert(new_id.clone(), sell_order);
-                                poll_list.lock().await.push((window_ts, new_id.clone()));
 
                                 // Update parent order.
                                 if let Some(mut parent) = state.orders.get_mut(&parent_id) {
+                                    /*
                                     parent.rapid_sell_state = RapidSellState::Completed;
                                     parent.rapid_sell_size = matched.to_string();
+                                    */
+                                    let sold_before =
+                                        Decimal::from_str(&parent.rapid_sell_size).unwrap_or_default();
+
+                                    parent.rapid_sell_size =
+                                        (sold_before + sell_amount).to_string();
+
+                                    let matched =
+                                        Decimal::from_str(&parent.size_matched).unwrap_or_default();
+
+                                    let remaining =
+                                        (matched
+                                            - Decimal::from_str(&parent.rapid_sell_size)
+                                                .unwrap_or_default())
+                                        .max(Decimal::ZERO);
+
+                                    if remaining >= dec!(5) {
+                                        parent.rapid_sell_state = RapidSellState::Idle;
+                                    } else {
+                                        parent.rapid_sell_state = RapidSellState::Completed;
+                                    }
                                 }
 
                                 state.touch();
@@ -756,14 +906,24 @@ fn spawn_rapid_sell_loop(
                             }
                             Err(e) => {
                                 if let Some(mut o) = state.orders.get_mut(&parent_id) {
-                                    o.rapid_sell_state = RapidSellState::Failed(e.to_string());
+                                    //o.rapid_sell_state = RapidSellState::Failed(e.to_string());
+                                    schedule_retry(
+                                        &mut o,
+                                        attempt,
+                                        e.to_string(),
+                                    );
                                 }
                                 notify(&event_tx, &format!("Rapid Sell rejected: {e}"), NotificationKind::Error).await;
                             }
                         },
                         Err(e) => {
                             if let Some(mut o) = state.orders.get_mut(&parent_id) {
-                                o.rapid_sell_state = RapidSellState::Failed(e.to_string());
+                                //o.rapid_sell_state = RapidSellState::Failed(e.to_string());
+                                schedule_retry(
+                                    &mut o,
+                                    attempt,
+                                    e.to_string(),
+                                );
                             }
                             notify(&event_tx, &format!("Rapid Sell transport error: {e}"), NotificationKind::Error).await;
                         }
@@ -879,6 +1039,23 @@ fn apply_order_status_update(
     terminal
 }
 
+pub const RAPID_SELL_MAX_ATTEMPTS: u32 = 8;
+
+pub fn rapid_sell_backoff(attempt: u32) -> std::time::Duration {
+    use std::time::Duration;
+
+    match attempt {
+        0 => Duration::from_secs(1),
+        1 => Duration::from_secs(2),
+        2 => Duration::from_secs(5),
+        3 => Duration::from_secs(10),
+        4 => Duration::from_secs(20),
+        5 => Duration::from_secs(30),
+        6 => Duration::from_secs(60),
+        _ => Duration::from_secs(120),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Notification helper
 // ---------------------------------------------------------------------------
@@ -890,6 +1067,34 @@ async fn notify(tx: &Sender<WorkerEvent>, msg: &str, kind: NotificationKind) {
             kind,
         })
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// Retry helpers
+// ---------------------------------------------------------------------------
+
+fn schedule_retry(
+    order: &mut TrackedOrder,
+    attempt: u32,
+    reason: impl Into<String>,
+) {
+    let reason = reason.into();
+
+    if attempt >= RAPID_SELL_MAX_ATTEMPTS {
+        order.rapid_sell_state = RapidSellState::PermanentlyFailed {
+            attempts: attempt,
+            reason,
+        };
+        return;
+    }
+
+    let retry_at = Instant::now() + rapid_sell_backoff(attempt);
+
+    order.rapid_sell_state = RapidSellState::RetryScheduled {
+        attempt: attempt + 1,
+        retry_at,
+        reason,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,13 +1253,11 @@ async fn place_order_limit(
     let size = Decimal::from_str(&payload.size)?;
     let side = parse_side(&payload.side)?;
 
-    let mut guard = client.lock().await;
-    let c = guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialised"))?;
-    c.set_tick_size(token_id, TickSize::Hundredth);
+    //client.set_tick_size(token_id, TickSize::Hundredth);
 
-    let order = c.limit_order().token_id(token_id).size(size).price(price).side(side).build().await?;
-    let signed = timed!("sign_limit", { c.sign(&signer, order).await? });
-    let resp = timed!("post_limit", { c.post_order(signed).await? });
+    let order = client.limit_order().token_id(token_id).size(size).price(price).side(side).build().await?;
+    let signed = timed!("sign_limit", { client.sign(&signer, order).await? });
+    let resp = timed!("post_limit", { client.post_order(signed).await? });
     Ok(resp)
 }
 
@@ -1082,11 +1285,9 @@ async fn place_order_market(
         _ => OrderType::FOK,
     };
 
-    let mut guard = client.lock().await;
-    let c = guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialised"))?;
-    c.set_tick_size(token_id, TickSize::Hundredth);
+    //client.set_tick_size(token_id, TickSize::Hundredth);
 
-    let mut builder = c.market_order().token_id(token_id).side(side).order_type(order_type);
+    let mut builder = client.market_order().token_id(token_id).side(side).order_type(order_type);
     if let Some(u) = &payload.usdc {
         builder = builder.amount(Amount::usdc(Decimal::from_str(u)?)?);
     } else if let Some(s) = &payload.shares {
@@ -1096,8 +1297,8 @@ async fn place_order_market(
     }
 
     let order = builder.build().await?;
-    let signed = c.sign(&signer, order).await?;
-    let resp = c.post_order(signed).await?;
+    let signed = client.sign(&signer, order).await?;
+    let resp = client.post_order(signed).await?;
     Ok(resp)
 }
 
@@ -1105,24 +1306,18 @@ async fn get_order_status(
     client: SharedClient,
     order_id: &str,
 ) -> anyhow::Result<OpenOrderResponse> {
-    let mut guard = client.lock().await;
-    let c = guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialised"))?;
-    Ok(c.order(order_id).await?)
+    Ok(client.order(order_id).await?)
 }
 
 async fn cancel_order(
     client: SharedClient,
     order_id: &str,
 ) -> anyhow::Result<CancelOrdersResponse> {
-    let mut guard = client.lock().await;
-    let c = guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialised"))?;
-    Ok(c.cancel_order(order_id).await?)
+    Ok(client.cancel_order(order_id).await?)
 }
 
 async fn cancel_all_orders(client: SharedClient) -> anyhow::Result<CancelOrdersResponse> {
-    let mut guard = client.lock().await;
-    let c = guard.as_mut().ok_or_else(|| anyhow::anyhow!("CLOB client not initialised"))?;
-    Ok(c.cancel_all_orders().await?)
+    Ok(client.cancel_all_orders().await?)
 }
 
 fn parse_side(s: &str) -> anyhow::Result<Side> {

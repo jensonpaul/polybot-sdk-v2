@@ -37,12 +37,40 @@ pub enum LocalOrderStatus {
     Failed(String),
 }
 
+/*
 #[derive(Clone, Debug, PartialEq)]
 pub enum RapidSellState {
     Idle,
     Pending,
     Completed,
     Failed(String),
+}
+*/
+#[derive(Clone, Debug, PartialEq)]
+pub enum RapidSellState {
+    Idle,
+
+    /// Sell order currently being submitted.
+    InFlight {
+        attempt: u32,
+        started_at: std::time::Instant,
+    },
+
+    /// Last submission failed and will be retried.
+    RetryScheduled {
+        attempt: u32,
+        retry_at: std::time::Instant,
+        reason: String,
+    },
+
+    /// Last confirmed matched amount already has a sell posted.
+    Completed,
+
+    /// Retry budget exhausted.
+    PermanentlyFailed {
+        attempts: u32,
+        reason: String,
+    },
 }
 
 /// A single tracked order — shared between the worker (writes) and the UI
@@ -212,6 +240,24 @@ impl AppState {
     #[inline]
     pub fn version(&self) -> u64 {
         self.version.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn pollable_orders(&self) -> Vec<String> {
+        self.orders
+            .iter()
+            .filter_map(|entry| {
+                let order = entry.value();
+
+                match order.status {
+                    LocalOrderStatus::Open
+                    | LocalOrderStatus::PartiallyFilled { .. }
+                    | LocalOrderStatus::FullyFilled => {
+                        Some(order.id.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
     }
 }
 

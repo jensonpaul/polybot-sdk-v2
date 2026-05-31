@@ -1,9 +1,5 @@
 ...continue from README.md
 
-Rapid sell to FullyFilled and retry with intervals
-
-remove poll_list
-
 First order is still auto canceled even after initial INIT_PING order status check (issue is something else) - client initiation/heartbeats?
 
 
