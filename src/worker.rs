@@ -222,7 +222,12 @@ impl PolymarketWorker {
                                         executed_size: None,
                                         status: LocalOrderStatus::Open,
                                         size_matched: "0".into(),
-                                        inline_sell_price: "0.10".into(),
+                                        //inline_sell_price: "0.10".into(),
+                                        inline_sell_price: Decimal::from_str(&rapid_price)
+                                            .ok()
+                                            .filter(|p| *p > Decimal::ZERO)
+                                            .map(|p| p.to_string())
+                                            .unwrap_or_else(|| "0.10".into()),
                                         inline_sell_size: "0".into(),
                                         inline_sell_market_type: "FAK".into(),
                                         rapid_sell_price: rapid_price,
