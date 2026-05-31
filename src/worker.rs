@@ -728,12 +728,21 @@ fn spawn_rapid_sell_loop(
                         return None;
                     }
 
+                    /*
                     if !matches!(order.status, LocalOrderStatus::TradeConfirmed) {
                         return None;
                     }
 
                     if !order.is_trade_fully_confirmed {
                         return None;
+                    }
+                    */
+                    match order.status {
+                        LocalOrderStatus::PartiallyFilled { .. }
+                        | LocalOrderStatus::FullyFilled
+                        | LocalOrderStatus::TradeOpen
+                        | LocalOrderStatus::TradeConfirmed => {}
+                        _ => return None,
                     }
 
                     let matched =
